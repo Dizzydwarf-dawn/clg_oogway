@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
 OMNIS-X Student Grievance PWA Server
-Serves the Progressive Web App static bundle, stores student grievances in SQLite,
-and dispatches reports directly to the OMNIS-X (JADE_PALACE) FastAPI backend
-(/api/v1/incidents) or a custom website webhook.
+Provides:
+- 4-User Authentication & Sessions (admin, student, faculty1 -> floor1, faculty2 -> floor2)
+- Floor-Targeted Alert Routing (Floor 1 -> faculty1, Floor 2 -> faculty2, All -> admin)
+- Real-Time Server-Sent Events (/api/stream) so resolutions & updates sync to all users immediately
+- SQLite persistence + OMNIS-X (JADE_PALACE) engine connector forwarding
 """
 
+import hashlib
 import json
 import mimetypes
 import os
+import queue
+import secrets
 import sqlite3
 import threading
 import urllib.parse
@@ -33,6 +38,8 @@ PORT = int(ENGINE_CFG.get("pwa_port", 8090))
 HOST = str(ENGINE_CFG.get("pwa_host", "0.0.0.0"))
 
 DB_LOCK = threading.Lock()
+STREAM_LOCK = threading.Lock()
+STREAM_SUBSCRIBERS = []  # List[tuple[str, queue.Queue]]
 
 VALID_CATEGORIES = {
     "water",
@@ -47,9 +54,30 @@ VALID_CATEGORIES = {
 VALID_SEVERITIES = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
 VALID_STATUSES = {"SUBMITTED", "ACKNOWLEDGED", "IN_PROGRESS", "RESOLVED"}
 
+FLOOR_LABELS = {
+    "ground": "LEVEL 00 (Utility Core)",
+    "floor1": "LEVEL 01 (Floor 1)",
+    "floor2": "LEVEL 02 (Floor 2)",
+    "roof": "LEVEL 03 (Admin & Roof)",
+}
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def hash_password(password: str, salt: str = None) -> str:
+    if salt is None:
+        salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
+    return f"{salt}${dk.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    if "$" not in stored:
+        return False
+    salt, _ = stored.split("$", 1)
+    return secrets.compare_digest(hash_password(password, salt), stored)
 
 
 def get_conn() -> sqlite3.Connection:
@@ -58,11 +86,62 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def broadcast_sse(event_name: str, payload: dict) -> None:
+    msg = f"event: {event_name}\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
+    with STREAM_LOCK:
+        dead = []
+        for idx, (_, q) in enumerate(STREAM_SUBSCRIBERS):
+            try:
+                q.put_nowait(msg)
+            except Exception:
+                dead.append(idx)
+        for idx in reversed(dead):
+            STREAM_SUBSCRIBERS.pop(idx)
+
+
 def init_db() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     with DB_LOCK:
         conn = get_conn()
         try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    assigned_floor TEXT DEFAULT ''
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id TEXT PRIMARY KEY,
+                    target_username TEXT NOT NULL,
+                    grievance_id TEXT NOT NULL,
+                    ticket_code TEXT NOT NULL,
+                    layer_id TEXT NOT NULL,
+                    room_code TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    alert_type TEXT NOT NULL,
+                    actor_name TEXT DEFAULT '',
+                    is_read INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS grievances (
@@ -93,16 +172,21 @@ def init_db() -> None:
                     photo_data_url TEXT DEFAULT '',
                     resolution_note TEXT DEFAULT '',
                     assigned_to TEXT DEFAULT '',
+                    reported_by TEXT DEFAULT '',
+                    updated_by TEXT DEFAULT '',
                     webhook_status TEXT DEFAULT 'local_only',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
-            # Safe schema migration if DB existed prior to backend_entity_id
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(grievances)").fetchall()}
             if "backend_entity_id" not in cols:
                 conn.execute("ALTER TABLE grievances ADD COLUMN backend_entity_id TEXT DEFAULT ''")
+            if "reported_by" not in cols:
+                conn.execute("ALTER TABLE grievances ADD COLUMN reported_by TEXT DEFAULT ''")
+            if "updated_by" not in cols:
+                conn.execute("ALTER TABLE grievances ADD COLUMN updated_by TEXT DEFAULT ''")
 
             conn.execute(
                 """
@@ -127,9 +211,33 @@ def init_db() -> None:
                     (k, v),
                 )
 
+            # Seed the 4 required users idempotently
+            default_users = [
+                ("admin", "admin123", "ADMIN", "Campus Admin", "ALL"),
+                ("student", "student123", "STUDENT", "Student Reporter", ""),
+                ("faculty1", "faculty123", "FACULTY", "Faculty 1 (Floor 1)", "floor1"),
+                ("faculty2", "faculty123", "FACULTY", "Faculty 2 (Floor 2)", "floor2"),
+            ]
+            for uname, pwd, role, dname, floor in default_users:
+                exists = conn.execute("SELECT 1 FROM users WHERE username = ?", (uname,)).fetchone()
+                if not exists:
+                    conn.execute(
+                        "INSERT INTO users (username, password_hash, role, display_name, assigned_floor) VALUES (?, ?, ?, ?, ?)",
+                        (uname, hash_password(pwd), role, dname, floor),
+                    )
+
             conn.commit()
         finally:
             conn.close()
+
+
+def user_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "username": row["username"],
+        "role": row["role"],
+        "displayName": row["display_name"],
+        "assignedFloor": row["assigned_floor"] or "",
+    }
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:
@@ -163,15 +271,60 @@ def row_to_dict(row: sqlite3.Row) -> dict:
         "photoDataUrl": row["photo_data_url"] or "",
         "resolutionNote": row["resolution_note"] or "",
         "assignedTo": row["assigned_to"] or "",
+        "reportedBy": row["reported_by"] if "reported_by" in row.keys() else "",
+        "updatedBy": row["updated_by"] if "updated_by" in row.keys() else "",
         "webhookStatus": row["webhook_status"] or "local_only",
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
 
 
+def alert_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "targetUsername": row["target_username"],
+        "grievanceId": row["grievance_id"],
+        "ticketCode": row["ticket_code"],
+        "layerId": row["layer_id"],
+        "roomCode": row["room_code"],
+        "title": row["title"],
+        "message": row["message"],
+        "alertType": row["alert_type"],
+        "actorName": row["actor_name"],
+        "isRead": bool(row["is_read"]),
+        "createdAt": row["created_at"],
+    }
+
+
 def get_config_dict(conn: sqlite3.Connection) -> dict:
     rows = conn.execute("SELECT key, value FROM config").fetchall()
     return {r["key"]: r["value"] for r in rows}
+
+
+def insert_alerts(conn: sqlite3.Connection, targets: list, grievance: dict, alert_type: str, message: str, actor_name: str) -> None:
+    now = utc_now_iso()
+    for uname in dict.fromkeys(targets):  # preserve order, dedupe
+        conn.execute(
+            """
+            INSERT INTO alerts (
+                id, target_username, grievance_id, ticket_code, layer_id, room_code,
+                title, message, alert_type, actor_name, is_read, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                uname,
+                grievance["id"],
+                grievance["ticket_code"],
+                grievance["layer_id"],
+                grievance["room_code"],
+                grievance["title"],
+                message,
+                alert_type,
+                actor_name,
+                now,
+            ),
+        )
 
 
 class GrievanceHandler(BaseHTTPRequestHandler):
@@ -197,6 +350,38 @@ class GrievanceHandler(BaseHTTPRequestHandler):
             raise ValueError("Invalid or oversized payload")
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
+
+    def get_auth_token(self, qs: dict = None) -> str:
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth.split(" ", 1)[1].strip()
+        if qs and "token" in qs and qs["token"]:
+            return qs["token"][0].strip()
+        return ""
+
+    def get_current_user(self, qs: dict = None):
+        token = self.get_auth_token(qs)
+        if not token:
+            return None
+        with DB_LOCK:
+            conn = get_conn()
+            row = conn.execute(
+                """
+                SELECT u.* FROM sessions s
+                JOIN users u ON u.username = s.username
+                WHERE s.token = ?
+                """,
+                (token,),
+            ).fetchone()
+            conn.close()
+        return user_to_dict(row) if row else None
+
+    def require_auth(self, qs: dict = None):
+        user = self.get_current_user(qs)
+        if not user:
+            self.send_json(401, {"error": "Authentication required. Please log in."})
+            return None
+        return user
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -227,6 +412,27 @@ class GrievanceHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/auth/me":
+            user = self.require_auth(qs)
+            if not user:
+                return
+            self.send_json(200, {"user": user})
+            return
+
+        if path == "/api/stream":
+            user = self.require_auth(qs)
+            if not user:
+                return
+            self.handle_sse_stream(user)
+            return
+
+        if path == "/api/alerts":
+            user = self.require_auth(qs)
+            if not user:
+                return
+            self.handle_get_alerts(user)
+            return
+
         if path == "/api/status":
             self.handle_get_status()
             return
@@ -236,6 +442,9 @@ class GrievanceHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/config":
+            user = self.require_auth(qs)
+            if not user:
+                return
             with DB_LOCK:
                 conn = get_conn()
                 cfg = get_config_dict(conn)
@@ -259,15 +468,43 @@ class GrievanceHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
+        if path == "/api/auth/login":
+            self.handle_login()
+            return
+
+        if path == "/api/auth/logout":
+            self.handle_logout()
+            return
+
+        if path == "/api/alerts/read":
+            user = self.require_auth()
+            if not user:
+                return
+            self.handle_mark_alerts_read(user)
+            return
+
         if path == "/api/grievances":
-            self.handle_create_grievance()
+            user = self.get_current_user()
+            self.handle_create_grievance(user)
             return
 
         if path == "/api/config":
+            user = self.require_auth()
+            if not user:
+                return
+            if user["role"] != "ADMIN":
+                self.send_json(403, {"error": "Only Admin can modify OMNIS-X integration settings."})
+                return
             self.handle_update_config()
             return
 
         if path == "/api/webhook-test":
+            user = self.require_auth()
+            if not user:
+                return
+            if user["role"] != "ADMIN":
+                self.send_json(403, {"error": "Only Admin can test integration connections."})
+                return
             self.handle_webhook_test()
             return
 
@@ -277,8 +514,11 @@ class GrievanceHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path.startswith("/api/grievances/"):
+            user = self.require_auth()
+            if not user:
+                return
             gid = path.split("/api/grievances/", 1)[1].strip("/")
-            self.handle_patch_grievance(gid)
+            self.handle_patch_grievance(gid, user)
             return
         self.send_json(404, {"error": "Endpoint not found"})
 
@@ -286,18 +526,134 @@ class GrievanceHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path.startswith("/api/grievances/"):
+            user = self.require_auth()
+            if not user:
+                return
+            if user["role"] != "ADMIN":
+                self.send_json(403, {"error": "Only Admin can delete grievances."})
+                return
             gid = path.split("/api/grievances/", 1)[1].strip("/")
             with DB_LOCK:
                 conn = get_conn()
                 cur = conn.execute("DELETE FROM grievances WHERE id = ?", (gid,))
+                conn.execute("DELETE FROM alerts WHERE grievance_id = ?", (gid,))
                 conn.commit()
                 conn.close()
             if cur.rowcount == 0:
                 self.send_json(404, {"error": "Grievance not found"})
                 return
+            broadcast_sse("grievance_deleted", {"id": gid})
             self.send_json(200, {"deleted": True, "id": gid})
             return
         self.send_json(404, {"error": "Endpoint not found"})
+
+    def handle_login(self) -> None:
+        try:
+            data = self.read_json_body()
+        except Exception as exc:
+            self.send_json(400, {"error": f"Invalid JSON body: {exc}"})
+            return
+
+        username = str(data.get("username", "")).strip().lower()
+        password = str(data.get("password", ""))
+        if not username or not password:
+            self.send_json(400, {"error": "Username and password are required."})
+            return
+
+        with DB_LOCK:
+            conn = get_conn()
+            row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+            if not row or not verify_password(password, row["password_hash"]):
+                conn.close()
+                self.send_json(401, {"error": "Invalid username or password."})
+                return
+
+            token = secrets.token_urlsafe(32)
+            conn.execute(
+                "INSERT INTO sessions (token, username, created_at) VALUES (?, ?, ?)",
+                (token, username, utc_now_iso()),
+            )
+            conn.commit()
+            conn.close()
+
+        self.send_json(200, {"token": token, "user": user_to_dict(row)})
+
+    def handle_logout(self) -> None:
+        token = self.get_auth_token()
+        if token:
+            with DB_LOCK:
+                conn = get_conn()
+                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                conn.commit()
+                conn.close()
+        self.send_json(200, {"ok": True})
+
+    def handle_sse_stream(self, user: dict) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        q = queue.Queue(maxsize=100)
+        entry = (user["username"], q)
+        with STREAM_LOCK:
+            STREAM_SUBSCRIBERS.append(entry)
+
+        try:
+            hello = f"event: connected\ndata: {json.dumps({'username': user['username'], 'role': user['role']})}\n\n".encode("utf-8")
+            self.wfile.write(hello)
+            self.wfile.flush()
+
+            while True:
+                try:
+                    msg = q.get(timeout=20)
+                    self.wfile.write(msg)
+                    self.wfile.flush()
+                except queue.Empty:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            with STREAM_LOCK:
+                if entry in STREAM_SUBSCRIBERS:
+                    STREAM_SUBSCRIBERS.remove(entry)
+
+    def handle_get_alerts(self, user: dict) -> None:
+        with DB_LOCK:
+            conn = get_conn()
+            rows = conn.execute(
+                "SELECT * FROM alerts WHERE target_username = ? ORDER BY created_at DESC LIMIT 50",
+                (user["username"],),
+            ).fetchall()
+            conn.close()
+        items = [alert_to_dict(r) for r in rows]
+        unread_count = sum(1 for a in items if not a["isRead"])
+        self.send_json(200, {"items": items, "unreadCount": unread_count})
+
+    def handle_mark_alerts_read(self, user: dict) -> None:
+        try:
+            data = self.read_json_body()
+        except Exception:
+            data = {"all": True}
+
+        with DB_LOCK:
+            conn = get_conn()
+            if data.get("alertId"):
+                conn.execute(
+                    "UPDATE alerts SET is_read = 1 WHERE id = ? AND target_username = ?",
+                    (str(data["alertId"]), user["username"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE alerts SET is_read = 1 WHERE target_username = ?",
+                    (user["username"],),
+                )
+            conn.commit()
+            conn.close()
+        self.send_json(200, {"ok": True})
 
     def handle_get_grievances(self, qs: dict) -> None:
         clauses = []
@@ -389,7 +745,7 @@ class GrievanceHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def handle_create_grievance(self) -> None:
+    def handle_create_grievance(self, current_user=None) -> None:
         try:
             data = self.read_json_body()
         except Exception as exc:
@@ -449,6 +805,18 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                     ticket_num += 1
                     ticket_code = f"GRV-2026-{ticket_num:04d}"
 
+                # Resolve assigned faculty for this floor
+                faculty_rows = conn.execute(
+                    "SELECT username, display_name FROM users WHERE role = 'FACULTY' AND assigned_floor = ?",
+                    (layer_id,),
+                ).fetchall()
+                assigned_faculty_usernames = [r["username"] for r in faculty_rows]
+                assigned_to_label = (
+                    ", ".join(r["display_name"] for r in faculty_rows)
+                    if faculty_rows
+                    else "Campus Admin"
+                )
+
                 cfg = get_config_dict(conn)
                 record = {
                     "id": gid,
@@ -477,7 +845,9 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                     "anonymous": anonymous,
                     "photo_data_url": photo_data_url,
                     "resolution_note": "",
-                    "assigned_to": "",
+                    "assigned_to": assigned_to_label,
+                    "reported_by": current_user["username"] if current_user else "student",
+                    "updated_by": "",
                     "webhook_status": "local_only",
                     "created_at": now,
                     "updated_at": now,
@@ -504,69 +874,137 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                         room_name, backend_entity_id, department, equipment, location_note,
                         pin_x, pin_y, pin_z, student_name, student_id, student_contact,
                         anonymous, photo_data_url, resolution_note, assigned_to,
-                        webhook_status, created_at, updated_at
+                        reported_by, updated_by, webhook_status, created_at, updated_at
                     ) VALUES (
                         :id, :ticket_code, :category, :sub_category, :title, :description,
                         :severity, :status, :layer_id, :layer_title, :room_id, :room_code,
                         :room_name, :backend_entity_id, :department, :equipment, :location_note,
                         :pin_x, :pin_y, :pin_z, :student_name, :student_id, :student_contact,
                         :anonymous, :photo_data_url, :resolution_note, :assigned_to,
-                        :webhook_status, :created_at, :updated_at
+                        :reported_by, :updated_by, :webhook_status, :created_at, :updated_at
                     )
                     """,
                     record,
                 )
+
+                # Alert respective floor faculty + admin
+                floor_label = FLOOR_LABELS.get(layer_id, layer_id)
+                alert_targets = assigned_faculty_usernames + ["admin"]
+                actor_label = current_user["displayName"] if current_user else (student_name or "Student")
+                insert_alerts(
+                    conn=conn,
+                    targets=alert_targets,
+                    grievance=record,
+                    alert_type="NEW_ISSUE",
+                    message=f"New {severity} issue in {room_code} ({floor_label}): {record['title']}",
+                    actor_name=actor_label,
+                )
+
                 conn.commit()
                 created = conn.execute("SELECT * FROM grievances WHERE id = ?", (gid,)).fetchone()
             finally:
                 conn.close()
 
-        self.send_json(201, {"item": row_to_dict(created)})
+        item = row_to_dict(created)
+        broadcast_sse(
+            "grievance_created",
+            {
+                "item": item,
+                "alertTargets": alert_targets,
+                "message": f"New issue in {room_code} ({FLOOR_LABELS.get(layer_id, layer_id)}): {title}",
+            },
+        )
+        self.send_json(201, {"item": item})
 
-    def handle_patch_grievance(self, gid: str) -> None:
+    def handle_patch_grievance(self, gid: str, user: dict) -> None:
+        if user["role"] not in {"ADMIN", "FACULTY"}:
+            self.send_json(403, {"error": "Only assigned Faculty or Admin can update or resolve grievances."})
+            return
+
         try:
             data = self.read_json_body()
         except Exception as exc:
             self.send_json(400, {"error": f"Invalid JSON body: {exc}"})
             return
 
-        updates = []
-        params = []
-        if "status" in data:
-            st = str(data["status"]).upper().strip()
-            if st not in VALID_STATUSES:
-                self.send_json(400, {"error": f"Invalid status: {st}"})
-                return
-            updates.append("status = ?")
-            params.append(st)
-        if "resolutionNote" in data:
-            updates.append("resolution_note = ?")
-            params.append(str(data["resolutionNote"])[:500])
-        if "assignedTo" in data:
-            updates.append("assigned_to = ?")
-            params.append(str(data["assignedTo"])[:120])
-
-        if not updates:
-            self.send_json(400, {"error": "No valid update fields provided"})
-            return
-
-        updates.append("updated_at = ?")
-        params.append(utc_now_iso())
-        params.append(gid)
-
         with DB_LOCK:
             conn = get_conn()
-            cur = conn.execute(
-                f"UPDATE grievances SET {', '.join(updates)} WHERE id = ?", params
+            existing = conn.execute("SELECT * FROM grievances WHERE id = ?", (gid,)).fetchone()
+            if not existing:
+                conn.close()
+                self.send_json(404, {"error": "Grievance not found"})
+                return
+
+            if user["role"] == "FACULTY" and user["assignedFloor"] and existing["layer_id"] != user["assignedFloor"]:
+                conn.close()
+                self.send_json(
+                    403,
+                    {
+                        "error": f"You are assigned to {FLOOR_LABELS.get(user['assignedFloor'], user['assignedFloor'])}. You can only update issues on your assigned floor."
+                    },
+                )
+                return
+
+            updates = []
+            params = []
+            new_status = existing["status"]
+            if "status" in data:
+                st = str(data["status"]).upper().strip()
+                if st not in VALID_STATUSES:
+                    conn.close()
+                    self.send_json(400, {"error": f"Invalid status: {st}"})
+                    return
+                new_status = st
+                updates.append("status = ?")
+                params.append(st)
+            if "resolutionNote" in data:
+                updates.append("resolution_note = ?")
+                params.append(str(data["resolutionNote"])[:500])
+            if "assignedTo" in data:
+                updates.append("assigned_to = ?")
+                params.append(str(data["assignedTo"])[:120])
+
+            if not updates:
+                conn.close()
+                self.send_json(400, {"error": "No valid update fields provided"})
+                return
+
+            updates.append("updated_by = ?")
+            params.append(user["displayName"])
+            updates.append("updated_at = ?")
+            params.append(utc_now_iso())
+            params.append(gid)
+
+            conn.execute(f"UPDATE grievances SET {', '.join(updates)} WHERE id = ?", params)
+            row = conn.execute("SELECT * FROM grievances WHERE id = ?", (gid,)).fetchone()
+
+            # Notify ALL users (student, admin, faculty1, faculty2) when faculty/admin updates or resolves
+            all_users = [r["username"] for r in conn.execute("SELECT username FROM users").fetchall()]
+            note_txt = f" — {row['resolution_note']}" if row["resolution_note"] else ""
+            alert_type = "RESOLVED" if new_status == "RESOLVED" else "STATUS_UPDATE"
+            msg = f"{row['ticket_code']} ({row['room_code']}) marked {new_status} by {user['displayName']}{note_txt}"
+            insert_alerts(
+                conn=conn,
+                targets=all_users,
+                grievance=dict(row),
+                alert_type=alert_type,
+                message=msg,
+                actor_name=user["displayName"],
             )
             conn.commit()
-            row = conn.execute("SELECT * FROM grievances WHERE id = ?", (gid,)).fetchone()
             conn.close()
 
-        if cur.rowcount == 0 or not row:
-            self.send_json(404, {"error": "Grievance not found"})
-            return
-        self.send_json(200, {"item": row_to_dict(row)})
+        item = row_to_dict(row)
+        broadcast_sse(
+            "grievance_updated",
+            {
+                "item": item,
+                "alertTargets": all_users,
+                "actor": user["displayName"],
+                "message": msg,
+            },
+        )
+        self.send_json(200, {"item": item})
 
     def handle_update_config(self) -> None:
         try:

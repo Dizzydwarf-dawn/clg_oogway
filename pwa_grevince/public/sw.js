@@ -1,6 +1,5 @@
-const CACHE_NAME = 'omnisx-pwa-v5';
+const CACHE_NAME = 'omnisx-pwa-v6';
 
-// Lightweight mobile-first app shell (no heavy 3D bundle cached upfront on phones)
 const APP_SHELL_ASSETS = [
   '/',
   '/index.html',
@@ -35,6 +34,9 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== 'GET') return;
+
+  // Never cache SSE stream or API calls
+  if (url.pathname === '/api/stream') return;
 
   if (url.pathname.startsWith('/api/')) {
     event.respondWith(

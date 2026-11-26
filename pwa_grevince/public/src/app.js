@@ -13,6 +13,9 @@ import { EngineClient } from './engineClient.js';
 import { enqueueGrievance, getQueuedGrievances, flushQueue } from './offlineQueue.js';
 
 const state = {
+  user: null, // { username, role, displayName, assignedFloor }
+  alerts: [],
+  unreadAlerts: 0,
   selectedCategory: 'water',
   selectedSubCategory: '',
   selectedSeverity: 'MEDIUM',
@@ -24,7 +27,7 @@ const state = {
   grievances: [],
   statusSummary: null,
   config: null,
-  desktopMapMode: '2d', // Fast 2D by default; lazy-load 3D only on explicit toggle
+  desktopMapMode: '2d',
   showPower: false,
   showData: false,
   deferredInstallPrompt: null,
@@ -36,8 +39,10 @@ let map2dDesktop = null;
 let map2dMobile = null;
 let map3d = null;
 let map3dInitialized = false;
+let streamSource = null;
+let pollTimer = null;
 
-function showToast(msg, duration = 3000) {
+function showToast(msg, duration = 3500) {
   const el = $('toast');
   el.textContent = msg;
   el.style.display = 'block';
@@ -97,7 +102,74 @@ async function refreshData() {
   await updateQueueBadge();
 }
 
+async function refreshAlerts() {
+  if (!state.user) return;
+  try {
+    const res = await EngineClient.fetchAlerts();
+    state.alerts = res.items || [];
+    state.unreadAlerts = res.unreadCount || 0;
+  } catch {
+    // offline
+  }
+  renderAlerts();
+}
+
+function renderAlerts() {
+  const countEl = $('alerts-count');
+  countEl.textContent = String(state.unreadAlerts);
+  countEl.style.background = state.unreadAlerts > 0 ? 'rgba(212,175,55,0.22)' : '#14151C';
+
+  const listEl = $('alerts-list');
+  if (!state.alerts.length) {
+    listEl.innerHTML = '<div style="text-align:center;padding:18px;font-size:12px;color:#8A8594;">No alerts yet.</div>';
+    return;
+  }
+
+  listEl.innerHTML = state.alerts
+    .map(
+      (a) => `
+      <div class="alert-item ${a.isRead ? '' : 'unread'}" data-alert-id="${escapeHtml(a.id)}" data-room="${escapeHtml(a.roomCode)}" data-layer="${escapeHtml(a.layerId)}">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+          <span class="mono" style="font-size:10px;color:${a.alertType === 'RESOLVED' ? '#52B788' : '#F5D061'};font-weight:700;">
+            ${escapeHtml(a.alertType)} • ${escapeHtml(a.ticketCode)}
+          </span>
+          <span class="mono" style="font-size:10px;color:#8A8594;">${escapeHtml(formatTime(a.createdAt))}</span>
+        </div>
+        <div style="font-size:12px;color:#E2E1E6;line-height:1.4;">${escapeHtml(a.message)}</div>
+      </div>`
+    )
+    .join('');
+
+  listEl.querySelectorAll('.alert-item').forEach((el) => {
+    el.addEventListener('click', async () => {
+      const aid = el.dataset.alertId;
+      const roomCode = el.dataset.room;
+      try {
+        await EngineClient.markAlertsRead(aid);
+      } catch {
+        // ignore
+      }
+      $('alerts-drawer').style.display = 'none';
+      if (roomCode) {
+        const room = getRoomMeta(roomCode);
+        if (room) {
+          if (map2dDesktop) map2dDesktop.selectRoom(room.id, null);
+          if (map2dMobile) map2dMobile.selectRoom(room.id, null);
+          setActiveLayerUI(room.layerId);
+        }
+      }
+      if (state.user && (state.user.role === 'FACULTY' || state.user.role === 'ADMIN')) {
+        switchTab('portal');
+      } else {
+        switchTab('status');
+      }
+      await refreshAlerts();
+    });
+  });
+}
+
 async function loadConfig() {
+  if (!state.user || state.user.role !== 'ADMIN') return;
   try {
     const cfg = await EngineClient.fetchConfig();
     state.config = cfg;
@@ -107,15 +179,178 @@ async function loadConfig() {
     $('cfg-omnisx-user').value = cfg.omnisxUserId || 'USR-PRINCIPAL';
     $('cfg-auto-forward').checked = cfg.autoForward !== false;
     $('omnisx-user-field').style.display = cfg.integrationMode === 'webhook' ? 'none' : 'block';
-    if (cfg.websiteName) {
-      $('portal-subtitle').textContent = cfg.websiteName.replace('OMNIS-X • ', '');
-    }
   } catch {
     // offline
   }
 }
 
-// --- Lightweight 2D Maps (Default on Phone & Desktop) ---
+// --- Role-Aware UI & Live SSE Stream ---
+function applyUserRoleUI() {
+  const user = state.user;
+  if (!user) return;
+
+  const isStaff = user.role === 'ADMIN' || user.role === 'FACULTY';
+  const isAdmin = user.role === 'ADMIN';
+
+  // Top bar badge
+  if (user.role === 'FACULTY') {
+    const lvl = user.assignedFloor === 'floor1' ? 'LEVEL 01' : user.assignedFloor === 'floor2' ? 'LEVEL 02' : user.assignedFloor;
+    $('user-role-badge').textContent = `${user.username.toUpperCase()} • ${lvl}`;
+  } else {
+    $('user-role-badge').textContent = user.role;
+  }
+  $('portal-subtitle').textContent = `Signed in as ${user.displayName}`;
+
+  // Show/hide Tab 3 (Floor Triage / Admin)
+  $('tab-btn-portal').style.display = isStaff ? 'block' : 'none';
+  $('mob-tab-portal').style.display = isStaff ? 'flex' : 'none';
+  $('desktop-tabs').style.gridTemplateColumns = isStaff ? 'repeat(3, 1fr)' : 'repeat(2, 1fr)';
+  $('mobile-nav').style.gridTemplateColumns = isStaff ? 'repeat(3, 1fr)' : 'repeat(2, 1fr)';
+
+  const portalLabel = isAdmin ? 'Admin & Sync' : 'My Floor Alerts';
+  $('tab-btn-portal').textContent = portalLabel;
+  $('mob-tab-portal').textContent = portalLabel;
+  $('admin-config-card').style.display = isAdmin ? 'block' : 'none';
+
+  // Default landing tab & floor focus
+  if (user.role === 'FACULTY') {
+    const floorLayer = getLayerMeta(user.assignedFloor);
+    $('role-triage-banner').innerHTML = `<strong style="color:#F5D061;">${escapeHtml(user.displayName)}</strong> — Receiving alerts for <strong>${escapeHtml(floorLayer.planeNumber)} (${escapeHtml(floorLayer.title)})</strong>. Resolving an issue here updates all users immediately.`;
+    $('triage-list-heading').textContent = `${floorLayer.planeNumber} Issue Queue`;
+    if (map2dDesktop) map2dDesktop.setLayer(user.assignedFloor);
+    if (map2dMobile) map2dMobile.setLayer(user.assignedFloor);
+    setActiveLayerUI(user.assignedFloor);
+    switchTab('portal');
+  } else if (isAdmin) {
+    $('role-triage-banner').innerHTML = `<strong style="color:#F5D061;">Campus Admin</strong> — Viewing all floors and OMNIS-X engine sync settings.`;
+    $('triage-list-heading').textContent = 'All Campus Issues (Admin Triage)';
+    switchTab('portal');
+  } else {
+    switchTab('report');
+  }
+}
+
+function startLiveSync() {
+  stopLiveSync();
+  streamSource = EngineClient.connectStream({
+    onCreated: async (ev) => {
+      await Promise.all([refreshData(), refreshAlerts()]);
+      const targets = ev.alertTargets || [];
+      if (state.user && targets.includes(state.user.username)) {
+        showToast(`ALERT: ${ev.message}`, 5500);
+      }
+    },
+    onUpdated: async (ev) => {
+      await Promise.all([refreshData(), refreshAlerts()]);
+      showToast(`UPDATE: ${ev.message}`, 5000);
+    },
+    onDeleted: async () => {
+      await Promise.all([refreshData(), refreshAlerts()]);
+    },
+  });
+
+  // Gentle 8-second fallback sync in case SSE reconnects on mobile sleep/wake
+  pollTimer = setInterval(() => {
+    if (state.user && navigator.onLine) {
+      refreshData();
+      refreshAlerts();
+    }
+  }, 8000);
+}
+
+function stopLiveSync() {
+  if (streamSource) {
+    streamSource.close();
+    streamSource = null;
+  }
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+async function enterAuthenticatedApp(user) {
+  state.user = user;
+  $('login-screen').style.display = 'none';
+  $('app-shell').style.display = 'flex';
+  if (map2dDesktop) map2dDesktop._render();
+  if (map2dMobile) map2dMobile._render();
+  applyUserRoleUI();
+  await Promise.all([loadConfig(), refreshData(), refreshAlerts()]);
+  startLiveSync();
+}
+
+function showLoginScreen() {
+  stopLiveSync();
+  state.user = null;
+  state.alerts = [];
+  state.unreadAlerts = 0;
+  $('alerts-drawer').style.display = 'none';
+  $('app-shell').style.display = 'none';
+  $('login-screen').style.display = 'flex';
+}
+
+function initAuth() {
+  $('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const errEl = $('login-error');
+    errEl.style.display = 'none';
+    const username = $('login-username').value.trim();
+    const password = $('login-password').value;
+    const btn = $('btn-login-submit');
+    btn.disabled = true;
+    btn.textContent = 'Signing in...';
+    try {
+      const user = await EngineClient.login(username, password);
+      await enterAuthenticatedApp(user);
+    } catch (err) {
+      errEl.textContent = err.message || 'Invalid credentials';
+      errEl.style.display = 'block';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Sign In to Portal';
+    }
+  });
+
+  document.querySelectorAll('.quick-user-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const u = btn.dataset.demoUser;
+      const p = btn.dataset.demoPass;
+      $('login-username').value = u;
+      $('login-password').value = p;
+      $('login-error').style.display = 'none';
+      try {
+        const user = await EngineClient.login(u, p);
+        await enterAuthenticatedApp(user);
+      } catch (err) {
+        $('login-error').textContent = err.message;
+        $('login-error').style.display = 'block';
+      }
+    });
+  });
+
+  $('btn-logout').addEventListener('click', async () => {
+    await EngineClient.logout();
+    showLoginScreen();
+  });
+
+  $('btn-alerts').addEventListener('click', () => {
+    const drawer = $('alerts-drawer');
+    const isOpen = drawer.style.display === 'flex';
+    drawer.style.display = isOpen ? 'none' : 'flex';
+  });
+
+  $('btn-close-alerts').addEventListener('click', () => {
+    $('alerts-drawer').style.display = 'none';
+  });
+
+  $('btn-mark-all-read').addEventListener('click', async () => {
+    await EngineClient.markAlertsRead(null);
+    await refreshAlerts();
+  });
+}
+
+// --- Lightweight 2D Maps ---
 function init2DMaps() {
   const callbacks = {
     onLayerChange: (layerId) => {
@@ -134,7 +369,7 @@ function init2DMaps() {
   map2dMobile = new CampusMap2D($('mobile-map2d-host'), callbacks);
 }
 
-// --- Lazy-loaded 3D Twin (Desktop optional only — never loaded on phone) ---
+// --- Lazy-loaded 3D Twin (Desktop optional only) ---
 async function init3DMapLazy() {
   if (map3dInitialized) return;
   map3dInitialized = true;
@@ -278,12 +513,10 @@ function setLocationFromMap(room, layer, coords) {
   setActiveLayerUI(room.layerId);
   $('room-select').value = room.id;
 
-  // Keep both 2D maps & optional 3D map synchronized
   if (map2dDesktop) map2dDesktop.selectRoom(room.id, state.pinCoords);
   if (map2dMobile) map2dMobile.selectRoom(room.id, state.pinCoords);
   if (map3d && map3d.selectedRoomId !== room.id) map3d.selectRoom(room.id, state.pinCoords);
 
-  // Touch-friendly equipment chips
   const eqField = $('equipment-field');
   const eqChips = $('equipment-chips');
   eqChips.innerHTML = '';
@@ -306,12 +539,19 @@ function setLocationFromMap(room, layer, coords) {
     eqField.style.display = 'none';
   }
 
+  const alertTargetNote =
+    room.layerId === 'floor1'
+      ? 'Alerts Faculty 1'
+      : room.layerId === 'floor2'
+      ? 'Alerts Faculty 2'
+      : 'Alerts Admin';
+
   const locBox = $('location-display');
   locBox.classList.add('selected');
   locBox.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
       <span class="badge" style="border-color:rgba(212,175,55,0.45);color:#F5D061;">${escapeHtml(room.code)} • ${escapeHtml(state.selectedLayer.planeNumber)}</span>
-      <span class="mono" style="font-size:10px;color:#9D8EB5;">${escapeHtml(room.backendEntityId)}</span>
+      <span class="mono" style="font-size:10px;color:#52B788;">${alertTargetNote}</span>
     </div>
     <div style="font-size:13px;font-weight:700;color:#fff;">${escapeHtml(room.name)}</div>
     <div style="font-size:11px;color:#8A8594;margin-top:2px;">${escapeHtml(room.department)}</div>
@@ -551,13 +791,10 @@ async function handleSubmitGrievance(e) {
     if (!navigator.onLine) throw new Error('offline');
     const item = await EngineClient.submitGrievance(payload);
     resetFormFields();
-    await refreshData();
+    await Promise.all([refreshData(), refreshAlerts()]);
 
     $('success-ticket-code').textContent = item.ticketCode;
-    $('success-sync-note').textContent =
-      item.webhookStatus && item.webhookStatus.startsWith('forwarded')
-        ? `Dispatched to OMNIS-X (${item.backendEntityId}) and saved locally.`
-        : `Saved in Campus Portal for ${item.roomCode} (${item.backendEntityId}).`;
+    $('success-sync-note').textContent = `Assigned & alerted: ${item.assignedTo || 'Campus Admin'} (${item.roomCode}).`;
     $('report-form-container').style.display = 'none';
     $('submission-success').style.display = 'block';
   } catch {
@@ -656,10 +893,10 @@ function renderStatusTab() {
         <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
           <span class="badge" style="border-color:${cat.color};color:${cat.color};">${escapeHtml(cat.shortLabel)}</span>
           <span class="badge">${escapeHtml(g.severity)}</span>
-          ${g.equipment ? `<span class="badge">${escapeHtml(g.equipment)}</span>` : ''}
+          ${g.assignedTo ? `<span class="badge">Assigned: ${escapeHtml(g.assignedTo)}</span>` : ''}
           <span class="mono" style="font-size:10px;color:#8A8594;margin-left:auto;">${escapeHtml(formatTime(g.createdAt))}</span>
         </div>
-        ${g.resolutionNote ? `<div style="margin-top:8px;padding:6px 8px;background:rgba(82,183,136,0.08);border-left:2px solid #52B788;font-size:11px;color:#cce8db;">Update: ${escapeHtml(g.resolutionNote)}</div>` : ''}
+        ${g.resolutionNote || g.updatedBy ? `<div style="margin-top:8px;padding:6px 8px;background:rgba(82,183,136,0.08);border-left:2px solid #52B788;font-size:11px;color:#cce8db;">${g.updatedBy ? `Updated by ${escapeHtml(g.updatedBy)}: ` : 'Update: '}${escapeHtml(g.resolutionNote || g.status)}</div>` : ''}
         ${g.photoDataUrl ? `<img src="${g.photoDataUrl}" alt="Attachment" style="margin-top:8px;max-height:84px;border-radius:6px;border:1px solid #2D303E;" />` : ''}
       </div>`;
     })
@@ -681,44 +918,58 @@ function renderStatusTab() {
 
 function renderAdminTriage() {
   const el = $('admin-triage-list');
-  if (!state.grievances.length) {
-    el.innerHTML = '<div style="font-size:12px;color:#8A8594;">No grievances submitted yet.</div>';
+  if (!state.user || (state.user.role !== 'ADMIN' && state.user.role !== 'FACULTY')) {
+    el.innerHTML = '';
     return;
   }
 
-  el.innerHTML = state.grievances
-    .map(
-      (g) => `
-      <div style="border:1px solid #252833;border-radius:6px;padding:10px;margin-bottom:8px;background:#14151C;">
+  const list =
+    state.user.role === 'FACULTY' && state.user.assignedFloor
+      ? state.grievances.filter((g) => g.layerId === state.user.assignedFloor)
+      : state.grievances;
+
+  if (!list.length) {
+    el.innerHTML = '<div style="font-size:12px;color:#8A8594;">No grievances reported on your assigned floor yet.</div>';
+    return;
+  }
+
+  el.innerHTML = list
+    .map((g) => {
+      const stMeta = STATUS_META[g.status] || { label: g.status, color: '#9D8EB5' };
+      return `
+      <div style="border:1px solid #252833;border-radius:8px;padding:11px;margin-bottom:10px;background:#14151C;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
           <strong class="mono" style="font-size:11px;color:#F5D061;">${escapeHtml(g.ticketCode)} • ${escapeHtml(g.roomCode)}</strong>
-          <span class="mono" style="font-size:10px;color:#9D8EB5;">${escapeHtml(g.webhookStatus)}</span>
+          <span class="badge" style="border-color:${stMeta.color};color:${stMeta.color};">${escapeHtml(stMeta.label)}</span>
         </div>
-        <div style="font-size:12px;font-weight:500;margin-bottom:8px;color:#E2E1E6;">${escapeHtml(g.title)}</div>
-        <div style="display:flex;gap:6px;align-items:center;">
-          <select class="select triage-status" data-id="${escapeHtml(g.id)}" style="padding:5px;font-size:12px;">
-            ${['SUBMITTED', 'ACKNOWLEDGED', 'IN_PROGRESS', 'RESOLVED']
-              .map((st) => `<option value="${st}" ${g.status === st ? 'selected' : ''}>${st}</option>`)
-              .join('')}
-          </select>
-          <input class="input triage-note" data-id="${escapeHtml(g.id)}" type="text" value="${escapeHtml(g.resolutionNote)}" placeholder="Resolution note..." style="padding:5px 8px;font-size:12px;" />
-          <button type="button" class="btn btn-sm btn-gold triage-save" data-id="${escapeHtml(g.id)}">Save</button>
+        <div style="font-size:13px;font-weight:600;margin-bottom:4px;color:#E2E1E6;">${escapeHtml(g.title)}</div>
+        <div style="font-size:12px;color:#8A8594;margin-bottom:8px;">${escapeHtml(g.description)}</div>
+        <div class="field" style="margin-bottom:8px;">
+          <input class="input triage-note" data-id="${escapeHtml(g.id)}" type="text" value="${escapeHtml(g.resolutionNote)}" placeholder="Resolution / action note for all users..." style="padding:7px 9px;font-size:12px;" />
         </div>
-      </div>`
-    )
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button type="button" class="btn btn-sm triage-action" data-id="${escapeHtml(g.id)}" data-status="ACKNOWLEDGED">Acknowledge</button>
+          <button type="button" class="btn btn-sm triage-action" data-id="${escapeHtml(g.id)}" data-status="IN_PROGRESS">In Progress</button>
+          <button type="button" class="btn btn-sm btn-gold triage-action" data-id="${escapeHtml(g.id)}" data-status="RESOLVED" style="margin-left:auto;">Mark Resolved</button>
+        </div>
+      </div>`;
+    })
     .join('');
 
-  el.querySelectorAll('.triage-save').forEach((btn) => {
+  el.querySelectorAll('.triage-action').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const id = btn.dataset.id;
-      const status = el.querySelector(`.triage-status[data-id="${id}"]`).value;
-      const resolutionNote = el.querySelector(`.triage-note[data-id="${id}"]`).value;
+      const status = btn.dataset.status;
+      const resolutionNote = el.querySelector(`.triage-note[data-id="${id}"]`).value.trim();
+      btn.disabled = true;
       try {
         await EngineClient.updateGrievanceStatus(id, { status, resolutionNote });
-        showToast('Status updated');
-        await refreshData();
+        showToast(`Marked ${status} — updated across all users`);
+        await Promise.all([refreshData(), refreshAlerts()]);
       } catch (err) {
         showToast(`Failed: ${err.message}`);
+      } finally {
+        btn.disabled = false;
       }
     });
   });
@@ -744,9 +995,6 @@ function initPortalTab() {
       const cfg = await EngineClient.saveConfig(body);
       state.config = cfg;
       $('cfg-auth-header').value = '';
-      if (cfg.websiteName) {
-        $('portal-subtitle').textContent = cfg.websiteName.replace('OMNIS-X • ', '');
-      }
       showToast('OMNIS-X connection settings saved');
     } catch (err) {
       showToast(`Error: ${err.message}`);
@@ -808,7 +1056,7 @@ async function syncQueuedItems() {
   await updateQueueBadge();
   if (synced.length > 0) {
     showToast(`Synced ${synced.length} offline report(s)`);
-    await refreshData();
+    await Promise.all([refreshData(), refreshAlerts()]);
   }
 }
 
@@ -816,8 +1064,8 @@ function initConnectivityAndPWA() {
   const updateOnlineStatus = () => {
     const online = navigator.onLine;
     $('conn-dot').classList.toggle('offline', !online);
-    $('conn-label').textContent = online ? 'ONLINE' : 'OFFLINE';
-    if (online) syncQueuedItems();
+    $('conn-label').textContent = online ? 'LIVE' : 'OFFLINE';
+    if (online && state.user) syncQueuedItems();
   };
 
   window.addEventListener('online', updateOnlineStatus);
@@ -847,12 +1095,19 @@ function initConnectivityAndPWA() {
 
 async function boot() {
   initNavigation();
+  initAuth();
   initFormControls();
   initPortalTab();
   init2DMaps();
   initDesktopModeSwitch();
   initConnectivityAndPWA();
-  await Promise.all([loadConfig(), refreshData()]);
+
+  const existingUser = await EngineClient.getMe();
+  if (existingUser) {
+    await enterAuthenticatedApp(existingUser);
+  } else {
+    showLoginScreen();
+  }
 }
 
 boot();

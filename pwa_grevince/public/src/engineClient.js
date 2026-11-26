@@ -1,12 +1,39 @@
 /**
- * Separated Frontend Engine API Client.
- * Isolates all HTTP communication with either:
- *   1) The PWA Relay Backend (/api/* -> engine_connector.py), OR
- *   2) The actual OMNIS-X FastAPI Engine (/api/v1/incidents) directly.
+ * Separated Frontend Engine & Auth API Client.
+ * Supports:
+ * - 4-User Auth (admin, student, faculty1 -> floor1, faculty2 -> floor2)
+ * - Floor Alerts & Real-Time SSE Stream (/api/stream)
+ * - Relay Mode (/api/*) or Direct OMNIS-X Engine Mode
  */
 
 import { ENGINE_CONFIG } from '/engine.config.js';
 import { getRoomMeta } from './campusData.js';
+
+const TOKEN_STORAGE_KEY = 'omnisx_auth_token';
+
+function getStoredToken() {
+  try {
+    return localStorage.getItem(TOKEN_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function setStoredToken(token) {
+  try {
+    if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    else localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function getAuthHeaders(extra = {}) {
+  const headers = { 'Content-Type': 'application/json', ...extra };
+  const token = getStoredToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
 
 function getDirectHeaders() {
   const headers = {
@@ -21,11 +48,15 @@ function getDirectHeaders() {
 
 async function httpJson(url, options = {}) {
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    headers: getAuthHeaders(options.headers || {}),
     ...options,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(data.detail || data.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -93,6 +124,69 @@ export const EngineClient = {
     return ENGINE_CONFIG.mode === 'direct';
   },
 
+  getToken() {
+    return getStoredToken();
+  },
+
+  async login(username, password) {
+    const res = await httpJson('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    });
+    setStoredToken(res.token);
+    return res.user;
+  },
+
+  async logout() {
+    try {
+      await httpJson('/api/auth/logout', { method: 'POST', body: '{}' });
+    } catch {
+      // ignore
+    }
+    setStoredToken('');
+  },
+
+  async getMe() {
+    const token = getStoredToken();
+    if (!token) return null;
+    try {
+      const res = await httpJson('/api/auth/me');
+      return res.user;
+    } catch {
+      setStoredToken('');
+      return null;
+    }
+  },
+
+  async fetchAlerts() {
+    if (!getStoredToken()) return { items: [], unreadCount: 0 };
+    return httpJson('/api/alerts');
+  },
+
+  async markAlertsRead(alertId = null) {
+    if (!getStoredToken()) return { ok: true };
+    return httpJson('/api/alerts/read', {
+      method: 'POST',
+      body: JSON.stringify(alertId ? { alertId } : { all: true }),
+    });
+  },
+
+  connectStream(handlers = {}) {
+    const token = getStoredToken();
+    if (!token || typeof EventSource === 'undefined') return null;
+    const es = new EventSource(`/api/stream?token=${encodeURIComponent(token)}`);
+    es.addEventListener('grievance_created', (e) => {
+      if (handlers.onCreated) handlers.onCreated(JSON.parse(e.data));
+    });
+    es.addEventListener('grievance_updated', (e) => {
+      if (handlers.onUpdated) handlers.onUpdated(JSON.parse(e.data));
+    });
+    es.addEventListener('grievance_deleted', (e) => {
+      if (handlers.onDeleted) handlers.onDeleted(JSON.parse(e.data));
+    });
+    return es;
+  },
+
   async fetchAll() {
     if (this.isDirectMode()) {
       const base = ENGINE_CONFIG.engineBaseUrl.replace(/\/$/, '');
@@ -154,7 +248,7 @@ export const EngineClient = {
           { method: 'POST', headers: getDirectHeaders() }
         );
       }
-      throw new Error('Direct mode supports verifying resolution; use OMNIS-X Response Workspace for triage.');
+      throw new Error('Direct mode supports verifying resolution; use Relay mode for full floor triage.');
     }
     return httpJson(`/api/grievances/${id}`, {
       method: 'PATCH',

@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#14151A" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="description" content="OMNIS-X Student Grievance PWA with fast 2D Campus Floor Plan" />
-    <title>OMNIS-X // Student Grievance PWA</title>
+    <meta name="description" content="OMNIS-X Campus Grievance Portal with Role Login and Floor Alerts" />
+    <title>OMNIS-X // Campus Grievance Portal</title>
 
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
@@ -23,15 +23,75 @@
     </script>
   </head>
   <body>
-    <div class="app-shell">
-      <!-- Top Header matching OMNIS-X TopNav.tsx -->
+    <!-- Login Gate Screen -->
+    <div id="login-screen" class="login-overlay cad-grid-pattern">
+      <div class="login-card">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px;">
+          <div class="brand-insignia" style="width:40px;height:40px;font-size:20px;">Ω</div>
+          <div>
+            <div class="brand-row">
+              <span class="brand-title" style="font-size:16px;">OMNIS-X</span>
+              <span class="brand-tag">CAMPUS PORTAL</span>
+            </div>
+            <div class="brand-sub">Sign in to report issues, receive floor alerts &amp; track fixes</div>
+          </div>
+        </div>
+
+        <div id="login-error" class="login-error"></div>
+
+        <form id="login-form">
+          <div class="field">
+            <label for="login-username">Username</label>
+            <input id="login-username" class="input" type="text" required autocomplete="username" placeholder="admin, student, faculty1, or faculty2" />
+          </div>
+          <div class="field">
+            <label for="login-password">Password</label>
+            <input id="login-password" class="input" type="password" required autocomplete="current-password" placeholder="Enter password" />
+          </div>
+          <button type="submit" id="btn-login-submit" class="btn btn-gold" style="width:100%;min-height:44px;font-size:13px;">
+            Sign In to Portal
+          </button>
+        </form>
+
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--charcoal-border);">
+          <div class="mono" style="font-size:10px;color:var(--dusty-purple);letter-spacing:0.06em;">
+            QUICK SIGN-IN ACCOUNTS
+          </div>
+          <div class="quick-users-grid">
+            <button type="button" class="quick-user-btn" data-demo-user="admin" data-demo-pass="admin123">
+              <div class="quick-user-role">ADMIN</div>
+              <div style="font-size:12px;font-weight:600;">Campus Admin</div>
+              <div class="quick-user-sub">All floors &amp; settings</div>
+            </button>
+            <button type="button" class="quick-user-btn" data-demo-user="student" data-demo-pass="student123">
+              <div class="quick-user-role">STUDENT</div>
+              <div style="font-size:12px;font-weight:600;">Student</div>
+              <div class="quick-user-sub">Report &amp; track updates</div>
+            </button>
+            <button type="button" class="quick-user-btn" data-demo-user="faculty1" data-demo-pass="faculty123">
+              <div class="quick-user-role">FACULTY 1</div>
+              <div style="font-size:12px;font-weight:600;">Floor 1 Incharge</div>
+              <div class="quick-user-sub">Alerts for LEVEL 01</div>
+            </button>
+            <button type="button" class="quick-user-btn" data-demo-user="faculty2" data-demo-pass="faculty123">
+              <div class="quick-user-role">FACULTY 2</div>
+              <div style="font-size:12px;font-weight:600;">Floor 2 Incharge</div>
+              <div class="quick-user-sub">Alerts for LEVEL 02</div>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Authenticated App Shell -->
+    <div id="app-shell" class="app-shell" style="display:none;">
       <header class="topbar">
         <div class="brand">
           <div class="brand-insignia">Ω</div>
           <div>
             <div class="brand-row">
               <span class="brand-title">OMNIS-X</span>
-              <span class="brand-tag">STUDENT PWA</span>
+              <span class="brand-tag" id="user-role-badge">PORTAL</span>
             </div>
             <div class="brand-sub" id="portal-subtitle">Apex Institute of Technology</div>
           </div>
@@ -49,20 +109,41 @@
             <button type="button" data-map-mode="3d">3D Twin</button>
           </div>
 
-          <div class="pill-status" id="conn-pill" title="Connection & Sync Status">
+          <div class="pill-status" id="conn-pill" title="Connection & Live Sync">
             <span class="dot" id="conn-dot"></span>
-            <span id="conn-label">ONLINE</span>
+            <span id="conn-label">LIVE</span>
           </div>
+
+          <button class="btn btn-sm" id="btn-alerts" title="Floor & Resolution Alerts">
+            Alerts <span id="alerts-count" class="badge" style="border-color:var(--gold);color:var(--gold-bright);">0</span>
+          </button>
+
           <button class="btn btn-sm" id="btn-sync-queue" style="display: none;">
             Sync (<span id="queue-count">0</span>)
           </button>
+
           <button class="btn btn-gold btn-sm" id="btn-install-pwa" style="display: none;">
             Install
+          </button>
+
+          <button class="btn btn-sm" id="btn-logout" title="Sign Out">
+            Logout
           </button>
         </div>
       </header>
 
-      <!-- Main Workspace -->
+      <!-- Alerts Slide-Down Drawer -->
+      <div id="alerts-drawer" class="alerts-drawer">
+        <div class="alerts-drawer-head">
+          <strong class="mono" style="font-size:12px;color:var(--gold-bright);">FLOOR &amp; STATUS ALERTS</strong>
+          <div style="display:flex;gap:6px;">
+            <button type="button" class="btn btn-sm" id="btn-mark-all-read">Mark Read</button>
+            <button type="button" class="btn btn-sm" id="btn-close-alerts">Close</button>
+          </div>
+        </div>
+        <div id="alerts-list" class="alerts-drawer-body"></div>
+      </div>
+
       <main class="workspace" id="workspace">
         <!-- Desktop Left Pane: Fast Spatial 2D by default, lazy-loaded 3D Twin on click -->
         <section class="map-pane" aria-label="Campus Map">
@@ -98,14 +179,15 @@
           </div>
         </section>
 
-        <!-- Student Grievance Form & Status Drawer (Full screen on Phones) -->
+        <!-- Right Drawer -->
         <aside class="side-pane">
-          <nav class="tabs" role="tablist">
-            <button class="tab-btn active" data-tab="report">Report Issue</button>
-            <button class="tab-btn" data-tab="status">Campus Status</button>
-            <button class="tab-btn" data-tab="portal">OMNIS-X Sync</button>
+          <nav class="tabs" id="desktop-tabs" role="tablist">
+            <button class="tab-btn active" data-tab="report" id="tab-btn-report">Report Issue</button>
+            <button class="tab-btn" data-tab="status" id="tab-btn-status">Campus Status</button>
+            <button class="tab-btn" data-tab="portal" id="tab-btn-portal" style="display:none;">Floor Triage</button>
           </nav>
 
+          <!-- Tab 1: Report Issue -->
           <div class="tab-body" id="tab-report">
             <div id="submission-success" class="success-panel" style="display:none;">
               <div style="width:44px;height:44px;border-radius:50%;background:rgba(82,183,136,0.18);border:1px solid rgba(82,183,136,0.45);color:#52B788;display:grid;place-items:center;margin:0 auto 10px;font-size:18px;">✓</div>
@@ -118,14 +200,12 @@
             </div>
 
             <div id="report-form-container">
-              <!-- Step 1: Location via fast 2D floor plan (inline on phone, synced with desktop map) -->
               <div class="section-card">
                 <div class="section-label">
                   <span>1. Where is the problem?</span>
                   <span class="mono" style="font-size:10px;color:#9D8EB5;">TAP FLOOR PLAN</span>
                 </div>
 
-                <!-- Mobile inline 2D blueprint -->
                 <div id="mobile-map2d-host" class="inline-map2d-host"></div>
 
                 <div class="location-box" id="location-display">
@@ -152,7 +232,6 @@
                 </div>
               </div>
 
-              <!-- Step 2: Issue Type -->
               <div class="section-card">
                 <div class="section-label">
                   <span>2. What is the problem?</span>
@@ -162,11 +241,10 @@
                 <div class="chip-row" id="subcategory-chips"></div>
               </div>
 
-              <!-- Step 3: Details & Send -->
               <form id="grievance-form" class="section-card" style="margin-bottom:0;">
                 <div class="section-label">
-                  <span>3. Details & Submit</span>
-                  <span class="mono" style="font-size:10px;color:#5A5565;">OFFLINE READY</span>
+                  <span>3. Details &amp; Submit</span>
+                  <span class="mono" style="font-size:10px;color:#5A5565;">AUTO-ALERTS FACULTY</span>
                 </div>
 
                 <div class="field">
@@ -181,7 +259,7 @@
 
                 <div class="field">
                   <label for="issue-desc">What is happening? *</label>
-                  <textarea id="issue-desc" class="textarea" required maxlength="1800" placeholder="Describe the water/AC/facility issue and how long it has been happening..."></textarea>
+                  <textarea id="issue-desc" class="textarea" required maxlength="1800" placeholder="Describe the issue and how long it has been happening..."></textarea>
                 </div>
 
                 <div class="field">
@@ -224,7 +302,7 @@
             </div>
           </div>
 
-          <!-- Tab 2: Live Campus Status -->
+          <!-- Tab 2: Live Campus Status (Visible to all users, synced live) -->
           <div class="tab-body" id="tab-status" style="display:none;">
             <div class="status-grid" id="system-status-cards"></div>
 
@@ -247,16 +325,24 @@
             <div id="grievance-feed"></div>
           </div>
 
-          <!-- Tab 3: OMNIS-X Sync & Admin -->
+          <!-- Tab 3: Role-Based Floor Triage & Admin Settings -->
           <div class="tab-body" id="tab-portal" style="display:none;">
+            <div id="role-triage-banner" class="role-banner"></div>
+
             <div class="section-card">
               <div class="section-label">
-                <span>OMNIS-X (JADE_PALACE) Connection</span>
-                <span class="mono" style="color:var(--gold-soft);">REST API</span>
+                <span id="triage-list-heading">Assigned Floor Issues</span>
+                <button type="button" class="btn btn-sm" id="btn-export-json">Export JSON</button>
               </div>
-              <p style="font-size:12px;color:var(--text-muted);margin:0 0 10px;line-height:1.45;">
-                Connect directly to your OMNIS-X website backend (<code class="mono">/api/v1/incidents</code>) or a custom webhook. Reports queued offline sync automatically.
-              </p>
+              <div id="admin-triage-list"></div>
+            </div>
+
+            <!-- Admin-Only OMNIS-X Connection Settings -->
+            <div id="admin-config-card" class="section-card" style="display:none;">
+              <div class="section-label">
+                <span>OMNIS-X (JADE_PALACE) Connection</span>
+                <span class="mono" style="color:var(--gold-soft);">ADMIN ONLY</span>
+              </div>
 
               <div class="field">
                 <label for="cfg-website-name">Institution / Portal Name</label>
@@ -296,23 +382,15 @@
                 <button type="button" class="btn" id="btn-test-webhook" style="min-height:42px;">Test Ping</button>
               </div>
             </div>
-
-            <div class="section-card">
-              <div class="section-label">
-                <span>Ticket Triage & Status Updates</span>
-                <button type="button" class="btn btn-sm" id="btn-export-json">Export JSON</button>
-              </div>
-              <div id="admin-triage-list"></div>
-            </div>
           </div>
         </aside>
       </main>
 
-      <!-- Mobile Bottom Nav (3 clean tabs: Report, Status, Sync) -->
-      <nav class="mobile-nav">
-        <button data-tab="report" class="active">Report Issue</button>
-        <button data-tab="status">Campus Status</button>
-        <button data-tab="portal">OMNIS-X Sync</button>
+      <!-- Mobile Bottom Nav -->
+      <nav class="mobile-nav" id="mobile-nav">
+        <button data-tab="report" id="mob-tab-report" class="active">Report Issue</button>
+        <button data-tab="status" id="mob-tab-status">Campus Status</button>
+        <button data-tab="portal" id="mob-tab-portal" style="display:none;">Floor Triage</button>
       </nav>
     </div>
 
