@@ -178,7 +178,7 @@ async function loadConfig() {
     $('cfg-webhook-url').value = cfg.webhookUrl || '';
     $('cfg-omnisx-user').value = cfg.omnisxUserId || 'USR-PRINCIPAL';
     $('cfg-auto-forward').checked = cfg.autoForward !== false;
-    $('omnisx-user-field').style.display = cfg.integrationMode === 'webhook' ? 'none' : 'block';
+    $('omnisx-user-field').style.display = cfg.integrationMode === 'omnisx' ? 'block' : 'none';
   } catch {
     // offline
   }
@@ -977,7 +977,7 @@ function renderAdminTriage() {
 
 function initPortalTab() {
   $('cfg-integration-mode').addEventListener('change', (e) => {
-    $('omnisx-user-field').style.display = e.target.value === 'webhook' ? 'none' : 'block';
+    $('omnisx-user-field').style.display = e.target.value === 'omnisx' ? 'block' : 'none';
   });
 
   $('btn-save-config').addEventListener('click', async () => {

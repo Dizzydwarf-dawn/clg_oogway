@@ -1,4 +1,4 @@
-const CACHE_NAME = 'omnisx-pwa-v6';
+const CACHE_NAME = 'omnisx-pwa-v7';
 
 const APP_SHELL_ASSETS = [
   '/',

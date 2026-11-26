@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from engine_connector import (
+    dispatch_alert_to_inbox,
     dispatch_record_to_engine,
     load_engine_config,
     ping_engine,
@@ -199,10 +200,10 @@ def init_db() -> None:
 
             defaults = {
                 "website_name": ENGINE_CFG.get("website_name", "OMNIS-X • Apex Institute of Technology"),
-                "integration_mode": ENGINE_CFG.get("engine_mode", "omnisx"),
-                "webhook_url": ENGINE_CFG.get("engine_incidents_url", "http://127.0.0.1:8000/api/v1/incidents"),
+                "integration_mode": ENGINE_CFG.get("engine_mode", "inbox"),
+                "webhook_url": ENGINE_CFG.get("inbox_url") or ENGINE_CFG.get("engine_incidents_url", "http://127.0.0.1:8000/api/v1/incidents"),
                 "omnisx_user_id": ENGINE_CFG.get("engine_user_id", "USR-PRINCIPAL"),
-                "webhook_auth_header": ENGINE_CFG.get("engine_auth_header", ""),
+                "webhook_auth_header": ENGINE_CFG.get("inbox_api_key") or ENGINE_CFG.get("engine_auth_header", ""),
                 "auto_forward": "true" if ENGINE_CFG.get("auto_forward", True) else "false",
             }
             for k, v in defaults.items():
@@ -855,15 +856,18 @@ class GrievanceHandler(BaseHTTPRequestHandler):
 
                 target_url = str(data.get("targetWebhookUrl", "")).strip() or cfg.get("webhook_url", "")
                 auto_forward = cfg.get("auto_forward", "true") == "true"
-                mode = cfg.get("integration_mode", "omnisx")
+                mode = cfg.get("integration_mode", "inbox")
+                req_host = self.headers.get("Host", "")
+                auth_header = cfg.get("webhook_auth_header", "") or ENGINE_CFG.get("inbox_api_key", "")
 
-                if target_url and auto_forward:
+                if target_url and auto_forward and mode != "inbox":
                     record["webhook_status"] = dispatch_record_to_engine(
                         record=record,
                         target_url=target_url,
                         mode=mode,
                         omnisx_user_id=cfg.get("omnisx_user_id", "USR-PRINCIPAL"),
-                        auth_header=cfg.get("webhook_auth_header", ""),
+                        auth_header=auth_header,
+                        request_host=req_host,
                     )
 
                 conn.execute(
@@ -891,14 +895,33 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                 floor_label = FLOOR_LABELS.get(layer_id, layer_id)
                 alert_targets = assigned_faculty_usernames + ["admin"]
                 actor_label = current_user["displayName"] if current_user else (student_name or "Student")
+                alert_msg = f"New {severity} issue in {room_code} ({floor_label}): {record['title']}"
                 insert_alerts(
                     conn=conn,
                     targets=alert_targets,
                     grievance=record,
                     alert_type="NEW_ISSUE",
-                    message=f"New {severity} issue in {room_code} ({floor_label}): {record['title']}",
+                    message=alert_msg,
                     actor_name=actor_label,
                 )
+
+                # Send real-time alert to main website's Inbox using its API key header
+                inbox_target = ENGINE_CFG.get("inbox_url", "") or (target_url if mode == "inbox" else "")
+                if inbox_target and auto_forward:
+                    inbox_status = dispatch_alert_to_inbox(
+                        target_url=inbox_target,
+                        auth_header=auth_header,
+                        record=record,
+                        alert_type="NEW_ISSUE",
+                        message=alert_msg,
+                        target_users=alert_targets,
+                        actor_name=actor_label,
+                        created_at=now,
+                        request_host=req_host,
+                        api_key_header_name=ENGINE_CFG.get("inbox_api_key_header", "X-API-Key"),
+                        async_send=True,
+                    )
+                    conn.execute("UPDATE grievances SET webhook_status = ? WHERE id = ?", (inbox_status, gid))
 
                 conn.commit()
                 created = conn.execute("SELECT * FROM grievances WHERE id = ?", (gid,)).fetchone()
@@ -991,8 +1014,30 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                 message=msg,
                 actor_name=user["displayName"],
             )
+            cfg = get_config_dict(conn)
             conn.commit()
+            row_dict_raw = dict(row)
             conn.close()
+
+        # Forward real-time status/resolution alert to main website's Inbox
+        auto_forward = cfg.get("auto_forward", "true") == "true"
+        mode = cfg.get("integration_mode", "inbox")
+        inbox_target = ENGINE_CFG.get("inbox_url", "") or (cfg.get("webhook_url", "") if mode == "inbox" else "")
+        auth_header = cfg.get("webhook_auth_header", "") or ENGINE_CFG.get("inbox_api_key", "")
+        if inbox_target and auto_forward:
+            dispatch_alert_to_inbox(
+                target_url=inbox_target,
+                auth_header=auth_header,
+                record=row_dict_raw,
+                alert_type=alert_type,
+                message=msg,
+                target_users=all_users,
+                actor_name=user["displayName"],
+                created_at=utc_now_iso(),
+                request_host=self.headers.get("Host", ""),
+                api_key_header_name=ENGINE_CFG.get("inbox_api_key_header", "X-API-Key"),
+                async_send=True,
+            )
 
         item = row_to_dict(row)
         broadcast_sse(
@@ -1021,7 +1066,8 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                     (str(data["websiteName"])[:120],),
                 )
             if "integrationMode" in data:
-                mode = "omnisx" if data["integrationMode"] == "omnisx" else "webhook"
+                raw_mode = str(data["integrationMode"]).strip().lower()
+                mode = raw_mode if raw_mode in {"omnisx", "inbox", "webhook"} else "inbox"
                 conn.execute(
                     "INSERT OR REPLACE INTO config (key, value) VALUES ('integration_mode', ?)",
                     (mode,),
@@ -1033,9 +1079,9 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                 )
             if "webhookUrl" in data:
                 url = str(data["webhookUrl"]).strip()
-                if url and not url.startswith(("http://", "https://")):
+                if url and not url.startswith(("http://", "https://", ":", "/")):
                     conn.close()
-                    self.send_json(400, {"error": "webhookUrl must start with http:// or https://"})
+                    self.send_json(400, {"error": "URL must start with http://, https://, or :PORT/path (same IP)"})
                     return
                 conn.execute(
                     "INSERT OR REPLACE INTO config (key, value) VALUES ('webhook_url', ?)",
@@ -1082,8 +1128,17 @@ class GrievanceHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "No target website URL configured."})
             return
 
-        auth = str(data.get("webhookAuthHeader", "")).strip() or cfg.get("webhook_auth_header", "")
-        self.send_json(200, ping_engine(url, auth_header=auth, timestamp=utc_now_iso()))
+        auth = str(data.get("webhookAuthHeader", "")).strip() or cfg.get("webhook_auth_header", "") or ENGINE_CFG.get("inbox_api_key", "")
+        self.send_json(
+            200,
+            ping_engine(
+                url,
+                auth_header=auth,
+                timestamp=utc_now_iso(),
+                request_host=self.headers.get("Host", ""),
+                api_key_header_name=ENGINE_CFG.get("inbox_api_key_header", "X-API-Key"),
+            ),
+        )
 
     def serve_static(self, req_path: str) -> None:
         if req_path == "/" or req_path == "":

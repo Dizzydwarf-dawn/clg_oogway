@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Separated OMNIS-X Engine Connection Module.
+Separated OMNIS-X Engine & Main Website Inbox Connection Module.
 
-This file isolates all communication with the actual OMNIS-X (JADE_PALACE)
-FastAPI backend or custom external webhook. When a new IP is assigned to the
-main OMNIS-X engine, update `engine_config.json` (or set environment variables
-like ENGINE_BASE_URL=http://<NEW_IP>:8000) without touching UI or DB code.
+Supports:
+- Real-time Inbox Alert Forwarding (`NEW_ISSUE`, `STATUS_UPDATE`, `RESOLVED`)
+  with API key header (`X-API-Key` or custom header) and same-IP shorthand (`:3000/api/inbox`).
+- Optional OMNIS-X Incident API / generic webhook forwarding.
 """
 
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENGINE_CONFIG_PATH = os.path.join(BASE_DIR, "engine_config.json")
 
-# Maps 2D/3D Campus Map room IDs -> OMNIS-X backend entity_id values
 ROOM_TO_OMNISX_ENTITY: Dict[str, str] = {
     "SUB-01": "SUBSTATION-01",
     "UPS-01": "UPS-LAB-02",
@@ -43,12 +43,15 @@ def load_engine_config() -> Dict[str, Any]:
         "pwa_host": "0.0.0.0",
         "pwa_port": 8090,
         "website_name": "OMNIS-X • Apex Institute of Technology",
-        "engine_mode": "omnisx",
+        "engine_mode": "inbox",
         "engine_base_url": "http://127.0.0.1:8000",
         "engine_incidents_path": "/api/v1/incidents",
         "engine_health_path": "/health",
         "engine_user_id": "USR-PRINCIPAL",
         "engine_auth_header": "",
+        "inbox_url": "",
+        "inbox_api_key_header": "X-API-Key",
+        "inbox_api_key": "",
         "auto_forward": True,
     }
     if os.path.isfile(ENGINE_CONFIG_PATH):
@@ -60,7 +63,6 @@ def load_engine_config() -> Dict[str, Any]:
         except Exception:
             pass
 
-    # Environment variable overrides for dynamic/new IP assignment
     if os.environ.get("HOST"):
         cfg["pwa_host"] = os.environ["HOST"]
     if os.environ.get("PORT"):
@@ -76,18 +78,59 @@ def load_engine_config() -> Dict[str, Any]:
         cfg["engine_user_id"] = os.environ["ENGINE_USER_ID"]
     if os.environ.get("ENGINE_AUTH_HEADER"):
         cfg["engine_auth_header"] = os.environ["ENGINE_AUTH_HEADER"]
+    if os.environ.get("INBOX_URL"):
+        cfg["inbox_url"] = os.environ["INBOX_URL"].strip()
+    if os.environ.get("INBOX_API_KEY"):
+        cfg["inbox_api_key"] = os.environ["INBOX_API_KEY"].strip()
+    if os.environ.get("INBOX_API_KEY_HEADER"):
+        cfg["inbox_api_key_header"] = os.environ["INBOX_API_KEY_HEADER"].strip()
 
     cfg["engine_base_url"] = str(cfg["engine_base_url"]).rstrip("/")
-    cfg["engine_incidents_url"] = (
-        f"{cfg['engine_base_url']}{cfg['engine_incidents_path']}"
-        if cfg["engine_mode"] == "omnisx"
-        else cfg["engine_base_url"]
-    )
+    if cfg.get("inbox_url"):
+        cfg["engine_incidents_url"] = cfg["inbox_url"]
+    elif cfg["engine_mode"] == "omnisx":
+        cfg["engine_incidents_url"] = f"{cfg['engine_base_url']}{cfg['engine_incidents_path']}"
+    else:
+        cfg["engine_incidents_url"] = cfg["engine_base_url"]
     return cfg
 
 
 def resolve_entity_id(room_id: str, explicit_entity_id: str = "") -> str:
     return (explicit_entity_id or ROOM_TO_OMNISX_ENTITY.get(room_id, room_id)).strip()
+
+
+def resolve_same_ip_url(target_url: str, request_host: str = "") -> str:
+    """
+    Allows same-IP shorthand such as ':3000/api/inbox' or '/api/inbox'
+    by resolving against the incoming request's host IP (falling back to 127.0.0.1).
+    """
+    url = str(target_url or "").strip()
+    if not url:
+        return ""
+    host_ip = "127.0.0.1"
+    if request_host:
+        host_ip = request_host.split(":", 1)[0].strip() or "127.0.0.1"
+    if url.startswith(":"):
+        return f"http://{host_ip}{url}"
+    if url.startswith("/"):
+        return f"http://{host_ip}{url}"
+    return url
+
+
+def build_auth_headers(auth_header: str = "", default_header_name: str = "X-API-Key") -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    raw = str(auth_header or "").strip()
+    if not raw:
+        return headers
+    if ":" in raw and not raw.lower().startswith("bearer "):
+        k, v = raw.split(":", 1)
+        headers[k.strip()] = v.strip()
+    elif raw.lower().startswith("bearer "):
+        headers["Authorization"] = raw
+    else:
+        # Raw API key string -> send using configured API key header (default X-API-Key)
+        headers[default_header_name or "X-API-Key"] = raw
+    return headers
 
 
 def build_omnisx_incident_payload(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -170,12 +213,46 @@ def build_webhook_payload(record: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def build_inbox_alert_payload(
+    record: Dict[str, Any],
+    alert_type: str,
+    message: str,
+    target_users: List[str],
+    actor_name: str,
+    created_at: str,
+) -> Dict[str, Any]:
+    """Builds the real-time alert payload sent to the main website's Inbox."""
+    return {
+        "event": "alert.created",
+        "alertType": alert_type,
+        "grievanceId": record["id"],
+        "ticketCode": record["ticket_code"],
+        "title": record["title"],
+        "message": message,
+        "severity": record["severity"],
+        "status": record["status"],
+        "category": record["category"],
+        "subCategory": record.get("sub_category", ""),
+        "layerId": record["layer_id"],
+        "roomId": record["room_id"],
+        "roomCode": record["room_code"],
+        "roomName": record["room_name"],
+        "backendEntityId": resolve_entity_id(record["room_id"], record.get("backend_entity_id", "")),
+        "assignedTo": record.get("assigned_to", ""),
+        "targetUsers": target_users,
+        "actorName": actor_name,
+        "resolutionNote": record.get("resolution_note", ""),
+        "createdAt": created_at,
+    }
+
+
 def post_json(
     target_url: str,
     payload: Dict[str, Any],
     auth_header: str = "",
     extra_headers: Optional[Dict[str, str]] = None,
     timeout: int = 5,
+    api_key_header_name: str = "X-API-Key",
 ) -> str:
     if not target_url or not target_url.startswith(("http://", "https://")):
         return "local_only"
@@ -187,12 +264,7 @@ def post_json(
     }
     if extra_headers:
         headers.update(extra_headers)
-    if auth_header:
-        if ":" in auth_header and not auth_header.lower().startswith("bearer "):
-            k, v = auth_header.split(":", 1)
-            headers[k.strip()] = v.strip()
-        else:
-            headers["Authorization"] = auth_header.strip()
+    headers.update(build_auth_headers(auth_header, default_header_name=api_key_header_name))
 
     req = urllib.request.Request(target_url, data=body, headers=headers, method="POST")
     try:
@@ -204,35 +276,98 @@ def post_json(
         return f"saved_locally ({type(exc).__name__})"
 
 
+def dispatch_alert_to_inbox(
+    target_url: str,
+    auth_header: str,
+    record: Dict[str, Any],
+    alert_type: str,
+    message: str,
+    target_users: List[str],
+    actor_name: str,
+    created_at: str,
+    request_host: str = "",
+    api_key_header_name: str = "X-API-Key",
+    async_send: bool = True,
+) -> str:
+    resolved_url = resolve_same_ip_url(target_url, request_host=request_host)
+    if not resolved_url or not resolved_url.startswith(("http://", "https://")):
+        return "local_only"
+
+    payload = build_inbox_alert_payload(
+        record=record,
+        alert_type=alert_type,
+        message=message,
+        target_users=target_users,
+        actor_name=actor_name,
+        created_at=created_at,
+    )
+    extra = {"X-OMNISX-Event": f"alert.{alert_type.lower()}"}
+
+    if async_send:
+        t = threading.Thread(
+            target=post_json,
+            kwargs={
+                "target_url": resolved_url,
+                "payload": payload,
+                "auth_header": auth_header,
+                "extra_headers": extra,
+                "api_key_header_name": api_key_header_name,
+            },
+            daemon=True,
+        )
+        t.start()
+        return "inbox_queued"
+
+    return post_json(
+        resolved_url,
+        payload,
+        auth_header=auth_header,
+        extra_headers=extra,
+        api_key_header_name=api_key_header_name,
+    )
+
+
 def dispatch_record_to_engine(
     record: Dict[str, Any],
     target_url: str,
-    mode: str = "omnisx",
+    mode: str = "inbox",
     omnisx_user_id: str = "USR-PRINCIPAL",
     auth_header: str = "",
+    request_host: str = "",
 ) -> str:
-    if not target_url:
+    resolved_url = resolve_same_ip_url(target_url, request_host=request_host)
+    if not resolved_url:
         return "local_only"
-    if mode == "omnisx" or "/api/v1/incidents" in target_url:
+    if mode == "omnisx" or "/api/v1/incidents" in resolved_url:
         payload = build_omnisx_incident_payload(record)
         return post_json(
-            target_url,
+            resolved_url,
             payload,
             auth_header=auth_header,
             extra_headers={"X-User-Id": omnisx_user_id or "USR-PRINCIPAL"},
         )
+    if mode == "inbox":
+        # In inbox mode, real-time alerts are dispatched by dispatch_alert_to_inbox
+        return "inbox_alerts_enabled"
     payload = build_webhook_payload(record)
     return post_json(
-        target_url,
+        resolved_url,
         payload,
         auth_header=auth_header,
         extra_headers={"X-OMNISX-Event": "grievance.created"},
     )
 
 
-def ping_engine(target_url: str, auth_header: str = "", timestamp: str = "") -> Dict[str, str]:
-    if "/api/v1/incidents" in target_url:
-        health_url = target_url.split("/api/v1/incidents")[0] + "/health"
+def ping_engine(
+    target_url: str,
+    auth_header: str = "",
+    timestamp: str = "",
+    request_host: str = "",
+    api_key_header_name: str = "X-API-Key",
+) -> Dict[str, str]:
+    resolved_url = resolve_same_ip_url(target_url, request_host=request_host)
+    if "/api/v1/incidents" in resolved_url:
+        health_url = resolved_url.split("/api/v1/incidents")[0] + "/health"
         try:
             with urllib.request.urlopen(health_url, timeout=4) as resp:
                 return {"result": f"OMNIS-X online ({resp.status})", "url": health_url}
@@ -240,12 +375,15 @@ def ping_engine(target_url: str, auth_header: str = "", timestamp: str = "") -> 
             return {"result": f"OMNIS-X unreachable ({type(exc).__name__})", "url": health_url}
 
     res = post_json(
-        target_url,
+        resolved_url,
         {
-            "event": "omnisx.pwa.ping",
-            "message": "Test connection from OMNIS-X Student Grievance PWA",
+            "event": "alert.ping",
+            "alertType": "PING",
+            "title": "OMNIS-X Inbox Connection Test",
+            "message": "Test real-time alert connection from Campus Grievance PWA",
             "timestamp": timestamp,
         },
         auth_header=auth_header,
+        api_key_header_name=api_key_header_name,
     )
-    return {"result": res, "url": target_url}
+    return {"result": res, "url": resolved_url}
