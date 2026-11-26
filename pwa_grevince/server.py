@@ -212,6 +212,33 @@ def init_db() -> None:
                     (k, v),
                 )
 
+            # Migrate untouched legacy or local mock defaults to the configured Laptop 2 inbox endpoint & key
+            legacy_urls = (
+                "",
+                ":8095/api/inbox",
+                "http://127.0.0.1:8000/api/v1/incidents",
+                "http://127.0.0.1:8000/api/v1/inbox",
+                "http://127.0.0.1:8000/api/v1/inbox/dispatch",
+            )
+            cur_url_row = conn.execute("SELECT value FROM config WHERE key = 'webhook_url'").fetchone()
+            migrated_url = False
+            if cur_url_row and cur_url_row[0] in legacy_urls and defaults["webhook_url"]:
+                conn.execute(
+                    "UPDATE config SET value = ? WHERE key = 'webhook_url'",
+                    (defaults["webhook_url"],),
+                )
+                conn.execute(
+                    "UPDATE config SET value = ? WHERE key = 'integration_mode'",
+                    (defaults["integration_mode"],),
+                )
+                migrated_url = True
+            cur_auth_row = conn.execute("SELECT value FROM config WHERE key = 'webhook_auth_header'").fetchone()
+            if cur_auth_row and (not cur_auth_row[0].strip() or migrated_url) and defaults["webhook_auth_header"]:
+                conn.execute(
+                    "UPDATE config SET value = ? WHERE key = 'webhook_auth_header'",
+                    (defaults["webhook_auth_header"],),
+                )
+
             # Seed the 4 required users idempotently
             default_users = [
                 ("admin", "admin123", "ADMIN", "Campus Admin", "ALL"),
@@ -906,7 +933,7 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                 )
 
                 # Send real-time alert to main website's Inbox using its API key header
-                inbox_target = ENGINE_CFG.get("inbox_url", "") or (target_url if mode == "inbox" else "")
+                inbox_target = (target_url if mode == "inbox" else "") or ENGINE_CFG.get("inbox_url", "")
                 if inbox_target and auto_forward:
                     inbox_status = dispatch_alert_to_inbox(
                         target_url=inbox_target,
@@ -918,7 +945,7 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                         actor_name=actor_label,
                         created_at=now,
                         request_host=req_host,
-                        api_key_header_name=ENGINE_CFG.get("inbox_api_key_header", "X-API-Key"),
+                        api_key_header_name=ENGINE_CFG.get("inbox_api_key_header", "X-OMNIS-API-KEY"),
                         async_send=True,
                     )
                     conn.execute("UPDATE grievances SET webhook_status = ? WHERE id = ?", (inbox_status, gid))
@@ -1022,7 +1049,7 @@ class GrievanceHandler(BaseHTTPRequestHandler):
         # Forward real-time status/resolution alert to main website's Inbox
         auto_forward = cfg.get("auto_forward", "true") == "true"
         mode = cfg.get("integration_mode", "inbox")
-        inbox_target = ENGINE_CFG.get("inbox_url", "") or (cfg.get("webhook_url", "") if mode == "inbox" else "")
+        inbox_target = (cfg.get("webhook_url", "") if mode == "inbox" else "") or ENGINE_CFG.get("inbox_url", "")
         auth_header = cfg.get("webhook_auth_header", "") or ENGINE_CFG.get("inbox_api_key", "")
         if inbox_target and auto_forward:
             dispatch_alert_to_inbox(
@@ -1035,7 +1062,7 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                 actor_name=user["displayName"],
                 created_at=utc_now_iso(),
                 request_host=self.headers.get("Host", ""),
-                api_key_header_name=ENGINE_CFG.get("inbox_api_key_header", "X-API-Key"),
+                api_key_header_name=ENGINE_CFG.get("inbox_api_key_header", "X-OMNIS-API-KEY"),
                 async_send=True,
             )
 
@@ -1136,7 +1163,7 @@ class GrievanceHandler(BaseHTTPRequestHandler):
                 auth_header=auth,
                 timestamp=utc_now_iso(),
                 request_host=self.headers.get("Host", ""),
-                api_key_header_name=ENGINE_CFG.get("inbox_api_key_header", "X-API-Key"),
+                api_key_header_name=ENGINE_CFG.get("inbox_api_key_header", "X-OMNIS-API-KEY"),
             ),
         )
 

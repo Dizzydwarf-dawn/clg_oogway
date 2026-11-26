@@ -44,14 +44,14 @@ def load_engine_config() -> Dict[str, Any]:
         "pwa_port": 8090,
         "website_name": "OMNIS-X • Apex Institute of Technology",
         "engine_mode": "inbox",
-        "engine_base_url": "http://127.0.0.1:8000",
+        "engine_base_url": "http://192.168.1.93:8000",
         "engine_incidents_path": "/api/v1/incidents",
         "engine_health_path": "/health",
         "engine_user_id": "USR-PRINCIPAL",
         "engine_auth_header": "",
-        "inbox_url": "",
-        "inbox_api_key_header": "X-API-Key",
-        "inbox_api_key": "",
+        "inbox_url": "http://192.168.1.93:8000/api/v1/inbox/dispatch",
+        "inbox_api_key_header": "X-OMNIS-API-KEY",
+        "inbox_api_key": "omnis_pwa_secret_key_2026",
         "auto_forward": True,
     }
     if os.path.isfile(ENGINE_CONFIG_PATH):
@@ -221,28 +221,44 @@ def build_inbox_alert_payload(
     actor_name: str,
     created_at: str,
 ) -> Dict[str, Any]:
-    """Builds the real-time alert payload sent to the main website's Inbox."""
+    """
+    Builds the exact JSON payload expected by OMNIS-X /api/v1/inbox/dispatch:
+    { title, source, category, severity, message, entity_id, metadata }
+    """
+    entity_id = resolve_entity_id(record["room_id"], record.get("backend_entity_id", ""))
+    prefix = f"[{alert_type}] " if alert_type != "NEW_ISSUE" else ""
     return {
-        "event": "alert.created",
-        "alertType": alert_type,
-        "grievanceId": record["id"],
-        "ticketCode": record["ticket_code"],
-        "title": record["title"],
+        "title": f"{prefix}[{record['room_code']}] {record['title']}",
+        "source": "Campus Grievance PWA",
+        "category": str(record.get("category", "OTHER")).upper(),
+        "severity": str(record.get("severity", "MEDIUM")).upper(),
         "message": message,
-        "severity": record["severity"],
-        "status": record["status"],
-        "category": record["category"],
-        "subCategory": record.get("sub_category", ""),
-        "layerId": record["layer_id"],
-        "roomId": record["room_id"],
-        "roomCode": record["room_code"],
-        "roomName": record["room_name"],
-        "backendEntityId": resolve_entity_id(record["room_id"], record.get("backend_entity_id", "")),
-        "assignedTo": record.get("assigned_to", ""),
-        "targetUsers": target_users,
-        "actorName": actor_name,
-        "resolutionNote": record.get("resolution_note", ""),
-        "createdAt": created_at,
+        "entity_id": entity_id,
+        "metadata": {
+            "event": "alert.created",
+            "alertType": alert_type,
+            "grievanceId": record["id"],
+            "ticketCode": record["ticket_code"],
+            "status": record["status"],
+            "subCategory": record.get("sub_category", ""),
+            "layerId": record["layer_id"],
+            "roomId": record["room_id"],
+            "roomCode": record["room_code"],
+            "roomName": record["room_name"],
+            "equipment": record.get("equipment", ""),
+            "locationNote": record.get("location_note", ""),
+            "assignedTo": record.get("assigned_to", ""),
+            "targetUsers": target_users,
+            "actorName": actor_name,
+            "resolutionNote": record.get("resolution_note", ""),
+            "coordinates3D": {
+                "x": record.get("pin_x", 0),
+                "y": record.get("pin_y", 0),
+                "z": record.get("pin_z", 0),
+            },
+            "reported_from": "Campus PWA",
+            "createdAt": created_at,
+        },
     }
 
 
@@ -252,7 +268,7 @@ def post_json(
     auth_header: str = "",
     extra_headers: Optional[Dict[str, str]] = None,
     timeout: int = 5,
-    api_key_header_name: str = "X-API-Key",
+    api_key_header_name: str = "X-OMNIS-API-KEY",
 ) -> str:
     if not target_url or not target_url.startswith(("http://", "https://")):
         return "local_only"
@@ -286,7 +302,7 @@ def dispatch_alert_to_inbox(
     actor_name: str,
     created_at: str,
     request_host: str = "",
-    api_key_header_name: str = "X-API-Key",
+    api_key_header_name: str = "X-OMNIS-API-KEY",
     async_send: bool = True,
 ) -> str:
     resolved_url = resolve_same_ip_url(target_url, request_host=request_host)
@@ -363,7 +379,7 @@ def ping_engine(
     auth_header: str = "",
     timestamp: str = "",
     request_host: str = "",
-    api_key_header_name: str = "X-API-Key",
+    api_key_header_name: str = "X-OMNIS-API-KEY",
 ) -> Dict[str, str]:
     resolved_url = resolve_same_ip_url(target_url, request_host=request_host)
     if "/api/v1/incidents" in resolved_url:
@@ -377,11 +393,18 @@ def ping_engine(
     res = post_json(
         resolved_url,
         {
-            "event": "alert.ping",
-            "alertType": "PING",
-            "title": "OMNIS-X Inbox Connection Test",
-            "message": "Test real-time alert connection from Campus Grievance PWA",
-            "timestamp": timestamp,
+            "title": "Campus Grievance PWA Connection Test",
+            "source": "Campus Grievance PWA",
+            "category": "OTHER",
+            "severity": "LOW",
+            "message": "Test real-time inbox alert connection from Campus Grievance PWA",
+            "entity_id": "CR-201",
+            "metadata": {
+                "event": "alert.ping",
+                "alertType": "PING",
+                "reported_from": "Campus PWA",
+                "timestamp": timestamp,
+            },
         },
         auth_header=auth_header,
         api_key_header_name=api_key_header_name,
