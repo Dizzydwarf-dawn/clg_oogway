@@ -10,8 +10,10 @@ const APP_SHELL_ASSETS = [
   '/icons/icon-192.png',
   '/icons/icon-512.png',
   '/src/app.js',
+  '/src/heroIntro.js',
   '/src/campusData.js',
   '/src/campusMap2d.js',
+  '/src/campusMap3d.js',
   '/src/engineClient.js',
   '/src/offlineQueue.js',
 ];

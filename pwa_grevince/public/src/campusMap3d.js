@@ -3,8 +3,11 @@ import { OrbitControls } from '/vendor/three/OrbitControls.js';
 import { LAYERS, ROOMS, CONDUITS } from './campusData.js';
 
 /**
- * Calm OMNIS-X 3D Campus Digital Twin Map (Charcoal / Dusty Purple / Gold)
- * Designed to match JADE_PALACE without visual clutter or overstimulation.
+ * OMNIS-X 3D Campus Digital Twin Map (Charcoal / Dusty Purple / Gold)
+ * Ported from JADE_PALACE CampusCanvas3D.tsx with:
+ * - Animated Live Network (Dusty Purple Data Fiber + Pulses) & Power Grid (Gold + Pulses)
+ * - Dynamic West/East Riser Shafts scaled by Exploded View
+ * - Interactive Room Raycasting, Gold Selection Highlight, and Live Grievance Status
  */
 export class CampusMap3D {
   constructor(container, callbacks = {}) {
@@ -14,9 +17,10 @@ export class CampusMap3D {
     this.selectedLayerId = 'all';
     this.selectedRoomId = null;
     this.hoveredRoomId = null;
-    this.explodedDistance = 1.6;
-    this.showPower = false; // Off by default to keep view calm & distraction-free
-    this.showData = false;
+    this.explodedDistance = 2.0;
+    this.showPower = true;
+    this.showData = true;
+    this.showPulses = true;
     this.grievances = [];
     this.draftPin = null;
 
@@ -29,15 +33,15 @@ export class CampusMap3D {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.1;
+    this.renderer.toneMappingExposure = 1.15;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.container.appendChild(this.renderer.domElement);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
-    this.controls.minDistance = 8;
-    this.controls.maxDistance = 105;
+    this.controls.minDistance = 6;
+    this.controls.maxDistance = 110;
     this.controls.maxPolarAngle = Math.PI / 2.02;
     this.controls.target.set(0, 6, 0);
 
@@ -52,22 +56,25 @@ export class CampusMap3D {
 
     this.buildingGroup = new THREE.Group();
     this.conduitGroup = new THREE.Group();
+    this.pulseGroup = new THREE.Group();
     this.beaconsGroup = new THREE.Group();
     this.draftPinGroup = new THREE.Group();
+    this.pulseEntries = [];
 
-    // OMNIS-X Charcoal & Warm Gold Lighting Rig
-    this.scene.add(new THREE.HemisphereLight(0x9d8eb5, 0x0e0f12, 0.85));
-    const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.4);
+    // OMNIS-X Charcoal & Gold Lighting Rig
+    this.scene.add(new THREE.HemisphereLight(0x9d8eb5, 0x0e0f12, 0.9));
+    const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.5);
     dirLight1.position.set(25, 35, 20);
     this.scene.add(dirLight1);
-    const dirLight2 = new THREE.DirectionalLight(0xd4af37, 0.9);
+    const dirLight2 = new THREE.DirectionalLight(0xd4af37, 1.1);
     dirLight2.position.set(-25, 20, -20);
     this.scene.add(dirLight2);
-    this.scene.add(new THREE.AmbientLight(0x2d2a38, 0.65));
+    this.scene.add(new THREE.AmbientLight(0x2d2a38, 0.7));
 
     this._buildGroundPlane();
     this.scene.add(this.buildingGroup);
     this.scene.add(this.conduitGroup);
+    this.scene.add(this.pulseGroup);
     this.scene.add(this.beaconsGroup);
     this.scene.add(this.draftPinGroup);
 
@@ -76,6 +83,7 @@ export class CampusMap3D {
     this._setupEvents();
     this._handleResize();
 
+    this.clock = new THREE.Clock();
     this._animate = this._animate.bind(this);
     this._rafId = requestAnimationFrame(this._animate);
   }
@@ -151,59 +159,62 @@ export class CampusMap3D {
         color: 0x191b22,
         fillOpacity: dimmed ? 0.05 : 0.3,
         lineColor: accent ? 0xd4af37 : 0x9d8eb5,
-        lineOpacity: dimmed ? 0.14 : accent ? 0.65 : 0.42,
+        lineOpacity: dimmed ? 0.14 : accent ? 0.68 : 0.44,
       });
       fg.add(group);
     };
 
     if (roomId.startsWith('CR-')) {
-      box([1.2, 1.0, 0.75], [0, -0.8, -2.5], true);
-      box([3.4, 1.6, 0.08], [0, 0.3, -3.2], true);
-      [-1.6, 0.2, 2.0].forEach((z) => {
-        [-2.5, 0, 2.5].forEach((x) => {
-          box([1.8, 0.72, 0.75], [x, -0.9, z], false);
-        });
+      box([1.8, 1.0, 0.8], [0, -0.9, -2.4], true);
+      box([4.5, 1.6, 0.08], [0, 0.2, -3.45], true);
+      box([0.6, 0.25, 0.6], [0, 1.3, -0.5], false);
+      [-1.8, 0.2, 2.2].forEach((z) => {
+        [-2.8, 0, 2.8].forEach((x) => box([1.8, 0.7, 0.7], [x, -0.85, z], false));
       });
     } else if (roomId === 'SUB-01') {
-      box([2.4, 2.0, 2.0], [-2.8, -0.5, 0], true);
-      box([2.4, 2.0, 2.0], [2.8, -0.5, 0], true);
-      box([7.2, 2.2, 0.9], [0, -0.4, -2.5], true);
+      box([2.8, 2.2, 2.2], [-2.8, -0.5, 0], true);
+      box([2.8, 2.2, 2.2], [2.8, -0.5, 0], true);
+      box([8.0, 2.4, 1.0], [0, -0.3, -2.6], true);
     } else if (roomId === 'UPS-01') {
-      [-1.8, 0, 1.8].forEach((rx) => box([1.2, 2.4, 1.8], [rx, -0.3, 0], true));
+      box([1.2, 2.2, 1.8], [-1.5, -0.4, 0], true);
+      box([1.2, 2.2, 1.8], [0, -0.4, 0], true);
+      box([1.0, 2.0, 2.4], [1.8, -0.5, -1.8], true);
+      box([1.0, 2.0, 2.4], [1.8, -0.5, 1.8], true);
     } else if (roomId === 'SRV-01') {
-      [-2.2, 0, 2.2].forEach((sx) => {
-        [-1.5, 1.5].forEach((sz) => box([1.4, 2.6, 0.9], [sx, -0.2, sz], false));
+      [-2.2, -0.8, 0.6, 2.0].forEach((x) => {
+        box([1.1, 2.4, 1.1], [x, -0.3, -1.5], false);
+        box([1.1, 2.4, 1.1], [x, -0.3, 1.5], false);
       });
       box([2.0, 0.6, 0.7], [0, 1.2, -2.6], true);
     } else if (roomId === 'BUS-01') {
-      [-9, -3, 3, 9].forEach((x) => box([0.6, 1.8, 0.5], [x, -0.6, -2.5], false));
-      [-6, 6].forEach((x) => box([8.5, 2.0, 2.5], [x, -0.6, 1.0], false));
+      [-9, -3, 3, 9].forEach((x) => box([0.6, 1.8, 0.5], [x, -0.6, -2.5], true));
+      [-6, 6].forEach((x) => box([8.5, 2.1, 2.6], [x, -0.6, 1.0], false));
     } else if (roomId === 'VLSI-201') {
-      box([2.0, 2.4, 1.8], [-3.2, -0.3, -2.4], false);
-      [-1, 2.2].forEach((x) => [-1.2, 1.5].forEach((z) => box([2.3, 0.8, 1.1], [x, -0.8, z], false)));
+      box([2.0, 2.5, 1.8], [-3.2, -0.3, -2.4], false);
+      [-1, 2.2].forEach((x) => [-1.2, 1.5].forEach((z) => box([2.4, 0.8, 1.2], [x, -0.6, z], true)));
     } else if (roomId === 'ROB-202') {
-      box([4.5, 2.6, 4.5], [0, -0.2, 0], true);
+      box([6.5, 2.2, 3.5], [0, 0, 0], true);
     } else if (roomId === 'HV-203') {
       box([1.6, 2.6, 1.6], [-2.5, -0.2, 0], true);
-      box([3.6, 2.5, 3.6], [1.8, -0.2, 0], false);
+      box([3.8, 2.6, 3.8], [1.8, -0.2, 0], false);
     } else if (roomId === 'SEM-204') {
       box([9.5, 0.5, 1.5], [0, -1.1, -2.8], true);
-      box([7.0, 2.0, 0.08], [0, 0.4, -3.45], false);
-      [-1.0, -0.6, -0.2, 0.2].forEach((y, idx) => box([10.5, 0.35, 1.1], [0, y, [-1.8, -0.4, 1.0, 2.4][idx]], false));
+      box([7.0, 2.0, 0.08], [0, 0.4, -3.45], true);
+      [-1.0, -0.6, -0.2, 0.2].forEach((y, idx) => box([9.8, 0.45, 0.45], [0, y + 0.35, [-1.8, -0.4, 1.0, 2.4][idx]], false));
     } else if (roomId === 'ADM-301') {
-      box([4.8, 0.75, 2.2], [0, -0.8, -0.5], false);
-      box([5.5, 1.8, 0.1], [0, 0.3, -3.5], true);
+      box([4.8, 0.15, 2.2], [0, -0.7, -0.5], true);
+      box([2.2, 0.75, 1.1], [-3.8, -0.7, 2.0], false);
     } else if (roomId === 'CTR-302') {
-      box([9.0, 2.1, 0.15], [0, 0.2, -3.2], true);
+      box([9.2, 2.2, 0.15], [0, 0.2, -3.2], true);
       box([3.2, 0.75, 1.2], [-2.5, -0.7, 0], false);
       box([3.2, 0.75, 1.2], [2.5, -0.7, 0], false);
     } else if (roomId === 'RF-303') {
       [-10, -6, -2, 2, 6, 10].forEach((x) => {
-        const { group } = this._cadBox([3.2, 0.08, 3.8], { position: [x, 0.2, 0], fillOpacity: 0.18, lineColor: 0x9d8eb5, lineOpacity: 0.5 });
+        const { group } = this._cadBox([3.2, 0.08, 3.8], { position: [x, 0.2, 0], fillOpacity: 0.18, lineColor: 0xd4af37, lineOpacity: 0.65 });
         group.rotation.x = -0.35;
         fg.add(group);
       });
-      box([1.2, 4.2, 1.2], [0, 2.1, -2.0], true);
+      box([1.2, 4.4, 1.2], [0, 2.2, -2.0], false);
     }
     return fg;
   }
@@ -228,13 +239,12 @@ export class CampusMap3D {
       const floorGroup = new THREE.Group();
       floorGroup.position.set(0, yElevation, 0);
 
-      // Structural slab matching OMNIS-X
       const slab = this._cadBox([34, 0.25, 19], {
         position: [0, 0.125, 0],
         color: 0x14151a,
         fillOpacity: isDimmedFloor ? 0.08 : 0.45,
         lineColor: 0x9d8eb5,
-        lineOpacity: isDimmedFloor ? 0.14 : 0.55,
+        lineOpacity: isDimmedFloor ? 0.15 : 0.6,
       });
       floorGroup.add(slab.group);
 
@@ -245,15 +255,15 @@ export class CampusMap3D {
             color: 0x14151a,
             fillOpacity: 0.05,
             lineColor: 0x5a5565,
-            lineOpacity: isDimmedFloor ? 0.08 : 0.28,
+            lineOpacity: isDimmedFloor ? 0.08 : 0.3,
           });
           floorGroup.add(col.group);
         });
       });
 
       if (layer.id === 'floor1' || layer.id === 'floor2') {
-        const w1 = this._cadBox([22, 3.2, 0.15], { position: [-4, 1.6, 1.2], fillOpacity: 0.04, lineColor: 0x5a5565, lineOpacity: isDimmedFloor ? 0.08 : 0.22 });
-        const w2 = this._cadBox([22, 3.2, 0.15], { position: [-4, 1.6, -1.2], fillOpacity: 0.04, lineColor: 0x5a5565, lineOpacity: isDimmedFloor ? 0.08 : 0.22 });
+        const w1 = this._cadBox([22, 3.2, 0.15], { position: [-4, 1.6, 1.2], fillOpacity: 0.04, lineColor: 0x5a5565, lineOpacity: isDimmedFloor ? 0.08 : 0.25 });
+        const w2 = this._cadBox([22, 3.2, 0.15], { position: [-4, 1.6, -1.2], fillOpacity: 0.04, lineColor: 0x5a5565, lineOpacity: isDimmedFloor ? 0.08 : 0.25 });
         floorGroup.add(w1.group, w2.group);
       }
 
@@ -265,35 +275,36 @@ export class CampusMap3D {
         const openIssues = this.grievances.filter((g) => g.roomId === room.id && g.status !== 'RESOLVED');
         const hasCritical = openIssues.some((g) => g.severity === 'CRITICAL');
 
-        // Calm OMNIS-X room color rules: Dusty Purple nominal, Gold focus/active, Muted Coral if critical
         let fillColor = 0x14151a;
-        let lineColor = 0xbdb0d3;
-        let fillOpacity = 0.18;
-        let lineOpacity = 0.72;
+        let lineColor = room.criticality === 'CRITICAL' ? 0xd4af37 : 0xffffff;
+        let fillOpacity = 0.16;
+        let lineOpacity = 0.75;
 
         if (isSelected) {
-          fillColor = 0x3b3117;
+          fillColor = 0x272433;
           lineColor = 0xf5d061;
-          fillOpacity = 0.34;
+          fillOpacity = 0.42;
           lineOpacity = 1.0;
         } else if (isHovered) {
-          fillColor = 0x2b2416;
+          fillColor = 0x1e2029;
           lineColor = 0xd4af37;
-          fillOpacity = 0.26;
+          fillOpacity = 0.32;
           lineOpacity = 0.95;
         } else if (hasCritical && !isDimmed) {
-          fillColor = 0x2b1719;
-          lineColor = 0xe05d5d;
+          fillColor = 0x7f1d1d;
+          lineColor = 0xef4444;
+          fillOpacity = 0.32;
+          lineOpacity = 0.95;
+        } else if (openIssues.length > 0 && !isDimmed) {
+          fillColor = 0x3b2c12;
+          lineColor = 0xe5a83b;
           fillOpacity = 0.24;
           lineOpacity = 0.9;
-        } else if (openIssues.length > 0 && !isDimmed) {
-          lineColor = 0xe5a83b;
-          lineOpacity = 0.85;
         }
 
         if (isDimmed) {
           fillOpacity = 0.05;
-          lineOpacity = 0.14;
+          lineOpacity = 0.15;
         }
 
         const roomBox = this._cadBox(
@@ -323,25 +334,83 @@ export class CampusMap3D {
 
   _rebuildConduits() {
     this.conduitGroup.clear();
+    this.pulseGroup.clear();
+    this.pulseEntries = [];
+
     if (!this.showPower && !this.showData) return;
 
-    CONDUITS.forEach((c) => {
-      if (c.type === 'POWER' && !this.showPower) return;
-      if (c.type === 'DATA' && !this.showData) return;
+    // West Power Riser & East Data Fiber Riser Shafts
+    const totalExplodedHeight = 11.4 + this.explodedDistance * 3;
+    if (this.showPower) {
+      const riserWest = this._cadBox([0.9, totalExplodedHeight, 0.9], {
+        position: [-4.5, totalExplodedHeight / 2, 0],
+        fillOpacity: 0.04,
+        lineColor: 0xd4af37,
+        lineOpacity: 0.42,
+      });
+      this.conduitGroup.add(riserWest.group);
+    }
+    if (this.showData) {
+      const riserEast = this._cadBox([0.9, totalExplodedHeight, 0.9], {
+        position: [4.5, totalExplodedHeight / 2, 0],
+        fillOpacity: 0.04,
+        lineColor: 0x9d8eb5,
+        lineOpacity: 0.42,
+      });
+      this.conduitGroup.add(riserEast.group);
+    }
+
+    const criticalRooms = new Set(
+      this.grievances
+        .filter((g) => g.status !== 'RESOLVED' && g.severity === 'CRITICAL')
+        .map((g) => g.roomId)
+    );
+
+    CONDUITS.forEach((c, idx) => {
+      const isPower = c.type === 'POWER';
+      const isData = c.type === 'DATA';
+      if (isPower && !this.showPower) return;
+      if (isData && !this.showData) return;
+
       const vecPts = c.points.map((p) => this._mapConduitPoint(p));
-      const color = c.type === 'POWER' ? 0xd4af37 : 0x9d8eb5;
+      const curve = new THREE.CatmullRomCurve3(vecPts, false, 'catmullrom', 0.05);
+      const isSevered =
+        (isPower && criticalRooms.has('SUB-01')) ||
+        (isData && criticalRooms.has('SRV-01'));
+
+      const lineColor = isSevered ? 0x4a4e5c : isPower ? 0xd4af37 : 0x9d8eb5;
+      const lineOpacity = isSevered ? 0.22 : isPower ? 0.88 : 0.78;
+
       this.conduitGroup.add(
         new THREE.Line(
           new THREE.BufferGeometry().setFromPoints(vecPts),
-          new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.55 })
+          new THREE.LineBasicMaterial({ color: lineColor, transparent: true, opacity: lineOpacity })
         )
       );
+
+      if (this.showPulses && !isSevered) {
+        const pulseColor = isPower ? 0xf5d061 : 0xbdb0d3;
+        const radius = isPower ? 0.16 : 0.13;
+        const speed = isData ? 0.32 : 0.22;
+        for (let p = 0; p < 2; p++) {
+          const sphere = new THREE.Mesh(
+            new THREE.SphereGeometry(radius, 8, 8),
+            new THREE.MeshBasicMaterial({ color: pulseColor, transparent: true, opacity: 0.95 })
+          );
+          this.pulseGroup.add(sphere);
+          this.pulseEntries.push({
+            mesh: sphere,
+            curve,
+            speed,
+            offset: p * 0.5 + idx * 0.11,
+          });
+        }
+      }
     });
   }
 
   _rebuildBeacons() {
     this.beaconsGroup.clear();
-    // Calm, non-blinking static floor markers for open grievances
     const seenRooms = new Set();
     this.grievances.forEach((g) => {
       if (g.status === 'RESOLVED' || seenRooms.has(g.roomId)) return;
@@ -351,13 +420,13 @@ export class CampusMap3D {
 
       const floorY = this._getFloorElevation(room.layerId);
       const isVisible = this.selectedLayerId === 'all' || this.selectedLayerId === room.layerId;
-      const col = new THREE.Color(g.severity === 'CRITICAL' ? 0xe05d5d : 0xe5a83b);
+      const col = new THREE.Color(g.severity === 'CRITICAL' ? 0xef4444 : 0xe5a83b);
 
       const marker = new THREE.Mesh(
-        new THREE.SphereGeometry(0.32, 16, 16),
-        new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: isVisible ? 0.9 : 0.2 })
+        new THREE.OctahedronGeometry(0.38, 0),
+        new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: isVisible ? 0.92 : 0.2 })
       );
-      marker.position.set(room.position[0], floorY + room.position[1] + room.dimensions.height / 2 + 0.55, room.position[2]);
+      marker.position.set(room.position[0], floorY + room.position[1] + room.dimensions.height / 2 + 0.65, room.position[2]);
       this.beaconsGroup.add(marker);
     });
   }
@@ -372,7 +441,6 @@ export class CampusMap3D {
     const px = this.draftPin.x;
     const pz = this.draftPin.z;
     const py = floorY + room.position[1];
-
     const gold = new THREE.Color(0xf5d061);
 
     const lineGeom = new THREE.BufferGeometry().setFromPoints([
@@ -403,6 +471,7 @@ export class CampusMap3D {
   setGrievances(list) {
     this.grievances = Array.isArray(list) ? list : [];
     this._rebuildBuilding();
+    this._rebuildConduits();
     this._rebuildBeacons();
   }
 
@@ -426,9 +495,10 @@ export class CampusMap3D {
     this._rebuildDraftPin();
   }
 
-  setUtilityLayers({ showPower, showData }) {
+  setUtilityLayers({ showPower, showData, showPulses }) {
     if (typeof showPower === 'boolean') this.showPower = showPower;
     if (typeof showData === 'boolean') this.showData = showData;
+    if (typeof showPulses === 'boolean') this.showPulses = showPulses;
     this._rebuildConduits();
   }
 
@@ -485,7 +555,7 @@ export class CampusMap3D {
   resetView() {
     this.selectedLayerId = 'all';
     this.selectedRoomId = null;
-    this.explodedDistance = 1.6;
+    this.explodedDistance = 2.0;
     this.draftPin = null;
     this._rebuildBuilding();
     this._rebuildConduits();
@@ -588,6 +658,8 @@ export class CampusMap3D {
 
   _animate() {
     this._rafId = requestAnimationFrame(this._animate);
+    const elapsed = this.clock.getElapsedTime();
+
     if (this.isTransitioning) {
       this.camera.position.lerp(this.targetCamPos, 0.08);
       this.controls.target.lerp(this.targetLookAt, 0.08);
@@ -598,6 +670,14 @@ export class CampusMap3D {
         this.isTransitioning = false;
       }
     }
+
+    // Animate live power & network data pulses along conduits
+    for (let i = 0; i < this.pulseEntries.length; i++) {
+      const p = this.pulseEntries[i];
+      const progress = (elapsed * p.speed + p.offset) % 1;
+      p.mesh.position.copy(p.curve.getPointAt(progress));
+    }
+
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
   }

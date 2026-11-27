@@ -104,10 +104,14 @@
         </div>
 
         <div class="topbar-actions">
-          <div class="mode-switch" id="map-mode-switch" title="Switch Desktop Map View">
-            <button type="button" data-map-mode="2d" class="active">Spatial 2D</button>
-            <button type="button" data-map-mode="3d">3D Twin</button>
+          <div class="mode-switch" id="map-mode-switch" title="Switch Map View">
+            <button type="button" data-map-mode="3d" class="active">3D Twin</button>
+            <button type="button" data-map-mode="2d">Spatial 2D</button>
           </div>
+
+          <button type="button" class="btn btn-sm" id="btn-replay-intro" title="Play Hero Cinematic Intro">
+            Cinematic
+          </button>
 
           <div class="pill-status" id="conn-pill" title="Connection & Live Sync">
             <span class="dot" id="conn-dot"></span>
@@ -172,8 +176,9 @@
               </div>
 
               <div class="utility-toggles">
-                <button type="button" class="util-btn" id="btn-toggle-power">Power Grid</button>
-                <button type="button" class="util-btn" id="btn-toggle-data">Data Fiber</button>
+                <button type="button" class="util-btn active-power" id="btn-toggle-power">Power Grid</button>
+                <button type="button" class="util-btn active-data" id="btn-toggle-data">Data Fiber</button>
+                <button type="button" class="util-btn active-pulses" id="btn-toggle-pulses">Live Pulses</button>
               </div>
             </div>
           </div>
@@ -352,7 +357,6 @@
               <div class="field">
                 <label for="cfg-integration-mode">Integration Format</label>
                 <select id="cfg-integration-mode" class="select">
-                  <option value="inbox">Main Website Inbox Alerts (Real-Time + API Key)</option>
                   <option value="omnisx">OMNIS-X Incident API (/api/v1/incidents)</option>
                   <option value="webhook">Custom Website Webhook (JSON)</option>
                 </select>
@@ -389,10 +393,30 @@
 
       <!-- Mobile Bottom Nav -->
       <nav class="mobile-nav" id="mobile-nav">
-        <button data-tab="report" id="mob-tab-report" class="active">Report Issue</button>
-        <button data-tab="status" id="mob-tab-status">Campus Status</button>
-        <button data-tab="portal" id="mob-tab-portal" style="display:none;">Floor Triage</button>
+        <button data-tab="twin" id="mob-tab-map" class="active">3D Twin</button>
+        <button data-tab="report" id="mob-tab-report">Report Issue</button>
+        <button data-tab="status" id="mob-tab-status">Status</button>
+        <button data-tab="portal" id="mob-tab-portal" style="display:none;">Triage</button>
       </nav>
+    </div>
+
+    <!-- Hero Cinematic Intro Overlay (Ported from JADE_PALACE) -->
+    <div id="hero-intro-overlay" class="hero-intro-overlay" style="display:none;" aria-label="OMNIS-X Cinematic Intro">
+      <div id="hero-canvas-host" class="hero-canvas-host"></div>
+      <div id="hero-flash" class="hero-flash"></div>
+      <div class="hero-vignette"></div>
+
+      <div id="hero-content" class="hero-content">
+        <div class="hero-badge">DIGITAL CAMPUS INFRASTRUCTURE</div>
+        <h1 class="hero-title">OMNIS-X</h1>
+        <p class="hero-subtitle">Real-time 3D Digital Twin, live utility network telemetry &amp; floor grievance dispatch</p>
+        <div class="hero-cta-row">
+          <button type="button" class="hero-btn-primary" data-hero-enter>ENTER DIGITAL TWIN</button>
+          <button type="button" class="btn" data-hero-replay>Replay Intro</button>
+        </div>
+      </div>
+
+      <button type="button" class="hero-skip-btn" data-hero-enter>Skip to 3D Twin &rsaquo;</button>
     </div>
 
     <div id="toast" class="toast"></div>

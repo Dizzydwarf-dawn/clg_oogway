@@ -9,6 +9,7 @@ import {
   getRoomMeta,
 } from './campusData.js';
 import { CampusMap2D } from './campusMap2d.js';
+import { HeroIntro } from './heroIntro.js';
 import { EngineClient } from './engineClient.js';
 import { enqueueGrievance, getQueuedGrievances, flushQueue } from './offlineQueue.js';
 
@@ -27,9 +28,10 @@ const state = {
   grievances: [],
   statusSummary: null,
   config: null,
-  desktopMapMode: '2d',
-  showPower: false,
-  showData: false,
+  desktopMapMode: '3d',
+  showPower: true,
+  showData: true,
+  showPulses: true,
   deferredInstallPrompt: null,
 };
 
@@ -39,6 +41,7 @@ let map2dDesktop = null;
 let map2dMobile = null;
 let map3d = null;
 let map3dInitialized = false;
+let heroIntro = null;
 let streamSource = null;
 let pollTimer = null;
 
@@ -178,7 +181,7 @@ async function loadConfig() {
     $('cfg-webhook-url').value = cfg.webhookUrl || '';
     $('cfg-omnisx-user').value = cfg.omnisxUserId || 'USR-PRINCIPAL';
     $('cfg-auto-forward').checked = cfg.autoForward !== false;
-    $('omnisx-user-field').style.display = cfg.integrationMode === 'omnisx' ? 'block' : 'none';
+    $('omnisx-user-field').style.display = cfg.integrationMode === 'webhook' ? 'none' : 'block';
   } catch {
     // offline
   }
@@ -205,7 +208,7 @@ function applyUserRoleUI() {
   $('tab-btn-portal').style.display = isStaff ? 'block' : 'none';
   $('mob-tab-portal').style.display = isStaff ? 'flex' : 'none';
   $('desktop-tabs').style.gridTemplateColumns = isStaff ? 'repeat(3, 1fr)' : 'repeat(2, 1fr)';
-  $('mobile-nav').style.gridTemplateColumns = isStaff ? 'repeat(3, 1fr)' : 'repeat(2, 1fr)';
+  $('mobile-nav').style.gridTemplateColumns = isStaff ? 'repeat(4, 1fr)' : 'repeat(3, 1fr)';
 
   const portalLabel = isAdmin ? 'Admin & Sync' : 'My Floor Alerts';
   $('tab-btn-portal').textContent = portalLabel;
@@ -269,7 +272,51 @@ function stopLiveSync() {
   }
 }
 
-async function enterAuthenticatedApp(user) {
+async function setMapMode(mode) {
+  state.desktopMapMode = mode;
+  $('map-mode-switch').querySelectorAll('button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.mapMode === mode);
+  });
+
+  if (mode === '3d') {
+    $('desktop-map2d-host').style.display = 'none';
+    $('desktop-map3d-wrap').style.display = 'block';
+    $('app-shell').classList.add('mobile-view-3d');
+    await init3DMapLazy();
+    if (map3d) {
+      map3d.setUtilityLayers({
+        showPower: state.showPower,
+        showData: state.showData,
+        showPulses: state.showPulses,
+      });
+      map3d._handleResize();
+    }
+  } else {
+    $('desktop-map3d-wrap').style.display = 'none';
+    $('desktop-map2d-host').style.display = 'flex';
+    $('app-shell').classList.remove('mobile-view-3d');
+  }
+}
+
+function playHeroIntro() {
+  const overlay = $('hero-intro-overlay');
+  if (!overlay) return;
+  if (heroIntro) {
+    heroIntro.dispose();
+    heroIntro = null;
+  }
+  overlay.style.display = 'flex';
+  heroIntro = new HeroIntro(overlay, {
+    onEnter: async () => {
+      heroIntro = null;
+      await setMapMode('3d');
+      switchMobileView('twin');
+      if (map3d) map3d._handleResize();
+    },
+  });
+}
+
+async function enterAuthenticatedApp(user, { showIntro = false } = {}) {
   state.user = user;
   $('login-screen').style.display = 'none';
   $('app-shell').style.display = 'flex';
@@ -277,10 +324,21 @@ async function enterAuthenticatedApp(user) {
   if (map2dMobile) map2dMobile._render();
   applyUserRoleUI();
   await Promise.all([loadConfig(), refreshData(), refreshAlerts()]);
+  await setMapMode('3d');
+  switchMobileView('twin');
   startLiveSync();
+  if (showIntro) {
+    playHeroIntro();
+  }
 }
 
 function showLoginScreen() {
+  if (heroIntro) {
+    heroIntro.dispose();
+    heroIntro = null;
+  }
+  const overlay = $('hero-intro-overlay');
+  if (overlay) overlay.style.display = 'none';
   stopLiveSync();
   state.user = null;
   state.alerts = [];
@@ -302,7 +360,7 @@ function initAuth() {
     btn.textContent = 'Signing in...';
     try {
       const user = await EngineClient.login(username, password);
-      await enterAuthenticatedApp(user);
+      await enterAuthenticatedApp(user, { showIntro: true });
     } catch (err) {
       errEl.textContent = err.message || 'Invalid credentials';
       errEl.style.display = 'block';
@@ -321,7 +379,7 @@ function initAuth() {
       $('login-error').style.display = 'none';
       try {
         const user = await EngineClient.login(u, p);
-        await enterAuthenticatedApp(user);
+        await enterAuthenticatedApp(user, { showIntro: true });
       } catch (err) {
         $('login-error').textContent = err.message;
         $('login-error').style.display = 'block';
@@ -332,6 +390,10 @@ function initAuth() {
   $('btn-logout').addEventListener('click', async () => {
     await EngineClient.logout();
     showLoginScreen();
+  });
+
+  $('btn-replay-intro').addEventListener('click', () => {
+    playHeroIntro();
   });
 
   $('btn-alerts').addEventListener('click', () => {
@@ -456,6 +518,15 @@ async function init3DMapLazy() {
     map3d.setExplodedDistance(val);
   });
 
+  $('btn-toggle-power').classList.toggle('active-power', state.showPower);
+  $('btn-toggle-data').classList.toggle('active-data', state.showData);
+  $('btn-toggle-pulses').classList.toggle('active-pulses', state.showPulses);
+  map3d.setUtilityLayers({
+    showPower: state.showPower,
+    showData: state.showData,
+    showPulses: state.showPulses,
+  });
+
   $('btn-toggle-power').addEventListener('click', () => {
     state.showPower = !state.showPower;
     $('btn-toggle-power').classList.toggle('active-power', state.showPower);
@@ -467,28 +538,19 @@ async function init3DMapLazy() {
     $('btn-toggle-data').classList.toggle('active-data', state.showData);
     map3d.setUtilityLayers({ showData: state.showData });
   });
+
+  $('btn-toggle-pulses').addEventListener('click', () => {
+    state.showPulses = !state.showPulses;
+    $('btn-toggle-pulses').classList.toggle('active-pulses', state.showPulses);
+    map3d.setUtilityLayers({ showPulses: state.showPulses });
+  });
 }
 
 function initDesktopModeSwitch() {
   $('map-mode-switch').addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-map-mode]');
     if (!btn) return;
-    const mode = btn.dataset.mapMode;
-    state.desktopMapMode = mode;
-
-    $('map-mode-switch').querySelectorAll('button').forEach((b) => {
-      b.classList.toggle('active', b.dataset.mapMode === mode);
-    });
-
-    if (mode === '3d') {
-      $('desktop-map2d-host').style.display = 'none';
-      $('desktop-map3d-wrap').style.display = 'block';
-      await init3DMapLazy();
-      if (map3d) map3d._handleResize();
-    } else {
-      $('desktop-map3d-wrap').style.display = 'none';
-      $('desktop-map2d-host').style.display = 'flex';
-    }
+    await setMapMode(btn.dataset.mapMode);
   });
 }
 
@@ -977,7 +1039,7 @@ function renderAdminTriage() {
 
 function initPortalTab() {
   $('cfg-integration-mode').addEventListener('change', (e) => {
-    $('omnisx-user-field').style.display = e.target.value === 'omnisx' ? 'block' : 'none';
+    $('omnisx-user-field').style.display = e.target.value === 'webhook' ? 'none' : 'block';
   });
 
   $('btn-save-config').addEventListener('click', async () => {
@@ -1026,7 +1088,7 @@ function initPortalTab() {
 }
 
 function switchTab(tabId) {
-  document.querySelectorAll('.tab-btn, .mobile-nav button').forEach((b) => {
+  document.querySelectorAll('.tab-btn').forEach((b) => {
     b.classList.toggle('active', b.dataset.tab === tabId);
   });
   ['report', 'status', 'portal'].forEach((id) => {
@@ -1034,9 +1096,25 @@ function switchTab(tabId) {
   });
 }
 
+function switchMobileView(tabId) {
+  document.querySelectorAll('.mobile-nav button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.tab === tabId);
+  });
+  if (tabId === 'twin') {
+    $('app-shell').classList.add('mobile-view-3d');
+    if (map3d) map3d._handleResize();
+  } else {
+    $('app-shell').classList.remove('mobile-view-3d');
+    switchTab(tabId);
+  }
+}
+
 function initNavigation() {
-  document.querySelectorAll('.tab-btn, .mobile-nav button').forEach((b) => {
+  document.querySelectorAll('.tab-btn').forEach((b) => {
     b.addEventListener('click', () => switchTab(b.dataset.tab));
+  });
+  document.querySelectorAll('.mobile-nav button').forEach((b) => {
+    b.addEventListener('click', () => switchMobileView(b.dataset.tab));
   });
 }
 
